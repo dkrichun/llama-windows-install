@@ -8,7 +8,9 @@
     пересоздать службу. Поддерживает флаг -Upgrade для автообновления.
     Папки install, logs, Downloads, Backup, Models сохраняются
     в LlamaCppDir при обновлении/переустановке.
-    Ведет лог работы в llama-windows-install.log.
+    Ведёт лог работы в llama-windows-install.log.
+    Проверяет зависимости (VC++ Redist, CUDA/VRAM), существование модели,
+    поддерживает ForceCPU для диагностики.
 #>
 [CmdletBinding()]
 param(
@@ -118,7 +120,7 @@ $DownloadsDir     = Get-Cfg     'paths'     'DownloadsDir'       ''
 $BackupDir        = Get-Cfg     'paths'     'BackupDir'          ''
 $ServiceName      = Get-Cfg     'service'   'ServiceName'        'LlamaCpp'
 $StartType        = Get-Cfg     'service'   'StartType'          'SERVICE_DELAYED_AUTO_START'
-$StartTimeoutSec  = Get-CfgInt  'service'   'StartTimeoutSeconds' 120
+$StartTimeoutSec  = Get-CfgInt  'service'   'StartTimeoutSeconds' 180
 $AppRestartDelay  = Get-CfgInt  'service'   'AppRestartDelay'    10000
 $AddToPath        = Get-CfgBool 'service'   'AddToPath'          $true
 $AddNssmToPath    = Get-CfgBool 'service'   'AddNssmToPath'      $true
@@ -140,9 +142,10 @@ $NGpuLayers       = Get-CfgInt  'server'    'NGpuLayers'         999
 $FlashAttention   = Get-CfgBool 'server'    'FlashAttention'     $true
 $Parallel         = Get-CfgInt  'server'    'Parallel'           1
 $ExtraArgs        = Get-Cfg     'server'    'ExtraArgs'          ''
+$ForceCPU         = Get-CfgBool 'server'    'ForceCPU'           $false
 
 if ($Upgrade) {
-    Write-Log "  [Upgrade] Автообновление: выбор версии отключен, будет установлена latest." -Color Magenta
+    Write-Log "  [Upgrade] Автообновление: выбор версии отключён, будет установлена latest." -Color Magenta
     $Force = $true
     $LlamaCppVersion = 'latest'
 }
@@ -175,7 +178,7 @@ $DownloadsDir = [IO.Path]::GetFullPath($DownloadsDir)
 $BackupDir    = [IO.Path]::GetFullPath($BackupDir)
 
 $ApiHost     = "${HostOnly}:${Port}"
-$InstallPath = [IO.Path]::GetFullPath((Join-Path $LlamaCppDir 'install'))
+$InstallPath = [IO.Path]::GetFullPath($scriptDir)
 
 $protectedPaths = @(
     $InstallPath
@@ -185,21 +188,9 @@ $protectedPaths = @(
     [IO.Path]::GetFullPath($ModelsDir)
 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
 
-$serverArgs = @(
-    '--model', "`"$ModelPath`"",
-    '--host', $HostOnly,
-    '--port', "$Port",
-    '--ctx-size', "$CtxSize",
-    '-ngl', "$NGpuLayers",
-    '--parallel', "$Parallel"
-)
-if ($FlashAttention) { $serverArgs += '-fa' }
-if (-not [string]::IsNullOrWhiteSpace($ExtraArgs)) {
-    $serverArgs += ($ExtraArgs -split ' ' | Where-Object { $_ -ne '' })
-}
-$serverArgsLine = $serverArgs -join ' '
-
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# ─── 3. Вспомогательные функции ───
 
 function Stop-LlamaProcesses {
     Write-Log "  → Завершение процессов llama.cpp..."
@@ -384,9 +375,108 @@ function Test-LlamaHealth {
     } catch { return $false }
 }
 
+function Test-VCRedist {
+    $regPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64'
+    )
+    foreach ($path in $regPaths) {
+        if (Test-Path $path) {
+            $ver = (Get-ItemProperty $path -ErrorAction SilentlyContinue).Version
+            if ($ver) {
+                Write-Log "  ✓ Visual C++ Redistributable найден (версия $ver)" -Color Green
+                return $true
+            }
+        }
+    }
+    Write-Log "  ✗ Visual C++ Redistributable (x64) не найден!" -Color Red
+    return $false
+}
+
+function Install-VCRedist {
+    $url = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+    $outFile = Join-Path $env:TEMP 'vc_redist.x64.exe'
+    Write-Log "  → Скачивание Visual C++ Redistributable..." -Color Cyan
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing
+        Write-Log "  → Установка (тихий режим)..." -Color Cyan
+        $p = Start-Process -FilePath $outFile -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru -NoNewWindow
+        Write-Log "  → Код возврата: $($p.ExitCode)" -Color DarkGray
+        if ($p.ExitCode -in @(0, 1638, 3010)) {
+            Write-Log "  ✓ Visual C++ Redistributable установлен." -Color Green
+            return $true
+        }
+        Write-Log "  ✗ Установка завершилась с кодом $($p.ExitCode)" -Color Red
+        return $false
+    } catch {
+        Write-Log "  ✗ Ошибка установки VC++ Redist: $_" -Color Red
+        return $false
+    } finally {
+        if (Test-Path $outFile) { Remove-Item $outFile -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Test-CudaCompatibility {
+    param([string]$RequiredVersion)
+    if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
+        $smiPath = Join-Path $env:ProgramFiles 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'
+        if (Test-Path $smiPath) {
+            $nvidiaSmi = $smiPath
+        } else {
+            Write-Log "  ✗ nvidia-smi не найден. Драйвер NVIDIA не установлен." -Color Red
+            return $false
+        }
+    } else {
+        $nvidiaSmi = 'nvidia-smi'
+    }
+
+    try {
+        $smiOut = & $nvidiaSmi 2>&1 | Out-String
+
+        # Поддерживаем оба формата: "CUDA Version: X.Y" и "CUDA UMD Version: X.Y"
+        $cudaVer = $null
+        if ($smiOut -match 'CUDA\s+(?:UMD\s+)?Version:\s*(\d+\.\d+)') {
+            $cudaVer = [version]$matches[1]
+        }
+
+        if (-not $cudaVer) {
+            Write-Log "  ✗ Не удалось распарсить версию CUDA из nvidia-smi" -Color Red
+            Write-Log "    Первые строки вывода:" -Color DarkGray
+            $smiOut -split "`n" | Select-Object -First 6 | ForEach-Object { Write-Log "      $_" -Color DarkGray }
+            return $false
+        }
+
+        # Извлекаем объём VRAM (первое число MiB/N/A в строке GPU)
+        $vramMb = $null
+        if ($smiOut -match '(\d+)MiB\s*/\s*(\d+)MiB') {
+            $vramMb = [int]$matches[2]
+        }
+
+        $reqVer = [version]($RequiredVersion -replace 'cuda-','' -replace '\.\d+$','')
+        Write-Log "  ℹ Драйвер поддерживает CUDA $cudaVer (требуется >= $reqVer)" -Color DarkGray
+        if ($vramMb) {
+            Write-Log "  ℹ VRAM: $vramMb MiB" -Color DarkGray
+            if ($vramMb -lt 8000) {
+                Write-Log "  ⚠ Мало VRAM ($vramMb MiB). Для 7B-модели рекомендуется -ngl <= 30, CtxSize <= 4096" -Color Yellow
+            }
+        }
+
+        if ($cudaVer.Major -ge $reqVer.Major) {
+            Write-Log "  ✓ Версия CUDA совместима." -Color Green
+            return $true
+        }
+        Write-Log "  ✗ Версия CUDA несовместима! Требуется $reqVer.x, обнаружена $cudaVer" -Color Red
+        return $false
+    } catch {
+        Write-Log "  ✗ Не удалось запустить nvidia-smi: $_" -Color Red
+        return $false
+    }
+}
+
 function Test-LlamaServeDirect {
-    param([string]$Exe, [string]$Args, [hashtable]$EnvVars)
-    Write-Log "  → Диагностика: пробуем запустить llama-server.exe напрямую (10 сек)..."
+    param([string]$Exe, [string]$Args, [int]$WaitSec = 15)
+    Write-Log "  → Прямой запуск llama-server.exe ($WaitSec сек)..."
+    Write-Log "    Аргументы: $Args"
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
@@ -395,31 +485,51 @@ function Test-LlamaServeDirect {
     $psi.RedirectStandardError = $true
     $psi.RedirectStandardOutput = $true
     $psi.CreateNoWindow = $true
-    if ($EnvVars) {
-        foreach ($k in $EnvVars.Keys) { $psi.EnvironmentVariables[$k] = $EnvVars[$k] }
-    }
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding  = [Text.Encoding]::UTF8
 
     try {
         $proc = [System.Diagnostics.Process]::Start($psi)
-        Start-Sleep -Seconds 10
+
+        # Асинхронно читаем оба потока, чтобы не заблокировать процесс
+        $stdoutSb = New-Object System.Text.StringBuilder
+        $stderrSb = New-Object System.Text.StringBuilder
+        $outEvent = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action {
+            if ($EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
+        } -MessageData $stdoutSb
+        $errEvent = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -Action {
+            if ($EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
+        } -MessageData $stderrSb
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+
+        Start-Sleep -Seconds $WaitSec
         $exited = $proc.HasExited
+        $exitCode = if ($exited) { $proc.ExitCode } else { $null }
+
+        Start-Sleep -Milliseconds 500
+
+        Unregister-Event -SourceIdentifier $outEvent.Name -ErrorAction SilentlyContinue
+        Unregister-Event -SourceIdentifier $errEvent.Name -ErrorAction SilentlyContinue
+
         if (-not $exited) {
-            Write-Log "    ✓ Процесс РАБОТАЕТ (значит llama-server.exe рабочий, проблема в конфиге NSSM)" -Color Green
+            Write-Log "    ✓ Процесс РАБОТАЕТ после $WaitSec сек (значит бинарник и модель ок)" -Color Green
             try { $proc.Kill() } catch {}
-            $proc.WaitForExit(3000) | Out-Null
+            try { $proc.WaitForExit(3000) | Out-Null } catch {}
         } else {
-            Write-Log "    ✗ Процесс УПАЛ с кодом $($proc.ExitCode)" -Color Red
+            Write-Log "    ✗ Процесс УПАЛ с кодом $exitCode" -Color Red
         }
-        $stderr = ''; $stdout = ''
-        try { $stderr = $proc.StandardError.ReadToEnd() } catch {}
-        try { $stdout = $proc.StandardOutput.ReadToEnd() } catch {}
+
+        $stdout = $stdoutSb.ToString()
+        $stderr = $stderrSb.ToString()
+
         if ($stderr -and $stderr.Trim()) {
             Write-Log "    STDERR:" -Color Yellow
-            $stderr -split "`n" | Select-Object -First 25 | ForEach-Object { Write-Log "      $_" -Color DarkGray }
+            $stderr -split "`n" | Select-Object -First 40 | ForEach-Object { Write-Log "      $_" -Color DarkGray }
         }
         if ($stdout -and $stdout.Trim()) {
-            Write-Log "    STDOUT (первые 15 строк):" -Color Yellow
-            $stdout -split "`n" | Select-Object -First 15 | ForEach-Object { Write-Log "      $_" -Color DarkGray }
+            Write-Log "    STDOUT (первые 30 строк):" -Color Yellow
+            $stdout -split "`n" | Select-Object -First 30 | ForEach-Object { Write-Log "      $_" -Color DarkGray }
         }
         return ($exited -eq $false)
     } catch {
@@ -479,7 +589,7 @@ function Start-LlamaService {
         (Join-Path $LogsDir 'llama-server.out.log')
     ) | Select-Object -Unique) {
         if (Test-Path $logFile) {
-            $lines = @(Get-Content $logFile -Tail 15 -ErrorAction SilentlyContinue)
+            $lines = @(Get-Content $logFile -Tail 20 -ErrorAction SilentlyContinue)
             if ($lines.Count -gt 0) {
                 Write-Log "`n  Файл $logFile (последние строки):" -Color Yellow
                 $lines | ForEach-Object { Write-Log "    $_" -Color DarkGray }
@@ -504,6 +614,7 @@ function Start-LlamaService {
     return $false
 }
 
+# ─── 4. Основной блок try ───
 try {
     $llamaServerExe = Join-Path $LlamaCppDir 'llama-server.exe'
     $currentVersion = $null
@@ -579,6 +690,7 @@ try {
     Write-Log "    • Режим          : $(if($isReinstall){'переустановка'} elseif($isUpgrade){'обновление/даунгрейд'} else {'первичная установка'})"
     Write-Log "    • Бэкап          : $(if($needsBackup){'будет создан'} else {'не требуется'})"
     Write-Log "    • Модель         : $ModelPath"
+    Write-Log "    • ForceCPU       : $ForceCPU"
 
     if (-not $Force -and $needsBackup) {
         Write-Host ""
@@ -598,6 +710,52 @@ try {
         Start-Sleep -Seconds 2
     }
     Stop-LlamaProcesses
+
+    # ─── Проверка зависимостей ───
+    Write-Step "Проверка системных зависимостей"
+
+    if (-not (Test-VCRedist)) {
+        Write-Log "  → Попытка автоматической установки..." -Color Yellow
+        if (-not (Install-VCRedist)) {
+            Write-Log "  ⚠ Не удалось установить VC++ Redist автоматически." -Color Yellow
+            Write-Log "  ⚠ Установите вручную: https://aka.ms/vs/17/release/vc_redist.x64.exe" -Color Yellow
+            if (-not $Force) {
+                $ans = Read-Host 'Продолжить установку? [y/N]'
+                if ($ans -ne 'y') { throw 'Отменено пользователем (нет VC++ Redist)' }
+            }
+        } elseif (-not (Test-VCRedist)) {
+            throw "Visual C++ Redistributable всё ещё не обнаружен после установки."
+        }
+    }
+
+    $useGpu = -not $ForceCPU
+    if ($useGpu) {
+        $cudaRequired = if ($llamaDownloadUrl -match 'cuda-(\d+\.\d+)') { $matches[1] } else { '13.5' }
+        if (-not (Test-CudaCompatibility -RequiredVersion $cudaRequired)) {
+            Write-Log "  ⚠ CUDA несовместима или не найдена. Служба может не запуститься." -Color Yellow
+            Write-Log "  ℹ Установите ForceCPU=true в INI, чтобы запустить без GPU." -Color Yellow
+            if (-not $Force) {
+                $ans = Read-Host 'Продолжить установку с GPU? [y/N]'
+                if ($ans -ne 'y') { throw 'Отменено пользователем (CUDA)' }
+            }
+        }
+    } else {
+        Write-Log "  ℹ ForceCPU=true — проверка CUDA пропущена, служба будет запущена без GPU." -Color DarkGray
+    }
+
+    # ─── Проверка модели ───
+    Write-Step "Проверка файла модели"
+    if (-not (Test-Path -LiteralPath $ModelPath)) {
+        Write-Log "  ✗ Файл модели не найден: $ModelPath" -Color Red
+        Write-Log "  ℹ Положите .gguf файл по этому пути или измените [server] Model в INI." -Color Yellow
+        if (-not $Force) {
+            $ans = Read-Host 'Продолжить всё равно? Служба скорее всего упадёт. [y/N]'
+            if ($ans -ne 'y') { throw 'Отменено пользователем (нет модели)' }
+        }
+    } else {
+        $modelSizeMb = [math]::Round((Get-Item -LiteralPath $ModelPath).Length / 1MB, 1)
+        Write-Log "  ✓ Модель найдена: $ModelPath ($modelSizeMb MB)" -Color Green
+    }
 
     Write-Step "Проверка порта $Port"
     $busy = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
@@ -659,7 +817,7 @@ try {
                 Copy-Item -Path $item.FullName -Destination $backupPath -Recurse -Force
             }
             Write-Log "  ✓ Резервная копия создана: $backupPath" -Color Green
-            Write-Log "  ℹ Папки install, logs, Downloads, Backup, Models не копировались (они сохраняются)" -Color DarkGray
+            Write-Log "  ℹ Папки install, logs, Downloads, Backup, Models не копировались" -Color DarkGray
         } catch {
             throw "Не удалось создать резервную копию (файлы заняты?). Ошибка: $_"
         }
@@ -728,6 +886,25 @@ try {
         Write-Log "  ✓ $ruleName" -Color Green
     }
 
+    # ─── Формирование аргументов сервера ───
+    $serverArgs = @(
+        '--model', "`"$ModelPath`"",
+        '--host', $HostOnly,
+        '--port', "$Port",
+        '--ctx-size', "$CtxSize",
+        '--parallel', "$Parallel"
+    )
+    if ($useGpu) {
+        $serverArgs += @('-ngl', "$NGpuLayers")
+        if ($FlashAttention) { $serverArgs += '-fa' }
+    } else {
+        $serverArgs += @('-ngl', '0')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExtraArgs)) {
+        $serverArgs += ($ExtraArgs -split ' ' | Where-Object { $_ -ne '' })
+    }
+    $serverArgsLine = $serverArgs -join ' '
+
     Write-Step "Регистрация службы $ServiceName"
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
         Write-Log '  → Остановка старой службы'
@@ -766,17 +943,48 @@ try {
     & $nssmExe set $ServiceName AppRestartDelay $AppRestartDelay 2>&1 | Out-Null
     & $nssmExe set $ServiceName AppThrottle 1500 2>&1 | Out-Null
     Write-Log '  ✓ Служба сконфигурирована' -Color Green
+    Write-Log "  Аргументы: $serverArgsLine" -Color DarkGray
 
     Write-Step 'Запуск службы'
     $ok = Start-LlamaService -NssmExe $nssmExe -ServiceName $ServiceName -TimeoutSec $StartTimeoutSec -MaxAttempts 3
     if (-not $ok) {
         Write-Log "`n=== ДОПОЛНИТЕЛЬНАЯ ДИАГНОСТИКА ===" -Color Yellow
-        Test-LlamaServeDirect -Exe $llamaServerExe -Args $serverArgsLine -EnvVars $null | Out-Null
+
+        Write-Log "`n  [1/3] Остановка службы, чтобы освободить порт..." -Color Cyan
+        & $nssmExe stop $ServiceName 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+        Stop-LlamaProcesses
+
+        Write-Log "`n  [2/3] Запуск с --verbose (полный лог)..." -Color Cyan
+        $verboseArgs = $serverArgsLine + ' --verbose'
+        $diagVerboseOk = Test-LlamaServeDirect -Exe $llamaServerExe -Args $verboseArgs -WaitSec 15
+
+        Write-Log "`n  [3/3] Запуск в режиме CPU (-ngl 0)..." -Color Cyan
+        $cpuArgs = $serverArgsLine -replace '-ngl \d+', '-ngl 0'
+        $cpuArgs = $cpuArgs -replace ' -fa\b', ''
+        $diagCpuOk = Test-LlamaServeDirect -Exe $llamaServerExe -Args $cpuArgs -WaitSec 15
+
+        if ($diagCpuOk) {
+            Write-Log "`n  ⚠ ВАЖНО: процесс РАБОТАЕТ в режиме CPU, но падает с GPU." -Color Yellow
+            Write-Log "  → Проблема в CUDA/драйвере/VRAM, а не в бинарнике или модели." -Color Yellow
+            Write-Log "  → Решения:" -Color Yellow
+            Write-Log "     1. Установите ForceCPU=true в [server] INI (временно, для работы)" -Color Yellow
+            Write-Log "     2. Обновите драйвер NVIDIA" -Color Yellow
+            Write-Log "     3. Уменьшите -ngl (например, 20) и/или --ctx-size" -Color Yellow
+        } elseif ($diagVerboseOk) {
+            Write-Log "`n  ⚠ Процесс работает при прямом запуске с --verbose, но NSSM не запускает." -Color Yellow
+            Write-Log "  → Проблема в конфигурации NSSM (права, рабочая директория, окружение)" -Color Yellow
+            Write-Log "  → Проверьте вывод 'nssm dump' выше" -Color Yellow
+        } else {
+            Write-Log "`n  ✗ Процесс падает и при прямом запуске. Смотрите STDERR выше." -Color Red
+            Write-Log "  → Вероятные причины: битый бинарник, отсутствует DLL, неверные аргументы" -Color Red
+        }
+
         throw "Служба $ServiceName не запустилась. Смотрите диагностику выше."
     }
 
     Write-Step 'Проверка API через /health'
-    $maxAttempts = 20
+    $maxAttempts = 40
     $apiOk = $false
     for ($i = 1; $i -le $maxAttempts; $i++) {
         Start-Sleep -Seconds 3
@@ -788,7 +996,12 @@ try {
             Write-Log "  … Попытка ${i}/${maxAttempts}: /health пока не готов"
         }
     }
-    if (-not $apiOk) { Write-Log "/health не ответил за $($maxAttempts * 3) секунд." -Color Yellow }
+    if (-not $apiOk) {
+        Write-Log "/health не ответил за $($maxAttempts * 3) секунд." -Color Yellow
+        Write-Log "Загрузка большой модели может занимать несколько минут. Проверьте вручную:" -Color Yellow
+        Write-Log "  curl http://127.0.0.1:$Port/health" -Color Yellow
+        Write-Log "  Get-Content '$LogsDir\llama-server.out.log' -Tail 30" -Color Yellow
+    }
 
     $actionLabel = if ($isReinstall) { 'переустановка' } elseif ($isUpgrade) { 'обновление/даунгрейд' } else { 'первичная установка' }
     Write-Log "`n=============================" -Color Green
@@ -803,7 +1016,7 @@ try {
     if ($backupPath) { Write-Log " Бэкап       : $backupPath" } else { Write-Log " Бэкапы      : $BackupDir (не требуется)" }
     Write-Log " API локально: http://127.0.0.1:$Port"
     Write-Log " Health-check: http://127.0.0.1:$Port/health"
-    Write-Log " Параметры   : CtxSize=$CtxSize, NGpuLayers=$NGpuLayers, FA=$FlashAttention, Parallel=$Parallel"
+    Write-Log " Параметры   : CtxSize=$CtxSize, NGpuLayers=$NGpuLayers, FA=$FlashAttention, Parallel=$Parallel, ForceCPU=$ForceCPU"
 
     if ($FirewallEnabled -and -not [string]::IsNullOrWhiteSpace($FirewallSubnet)) {
         $localIps = @()
