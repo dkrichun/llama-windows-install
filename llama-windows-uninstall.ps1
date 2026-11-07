@@ -8,8 +8,6 @@
     чистит брандмауэр, PATH (LlamaCppDir, NSSM\win32, NSSM\win64)
     и переменные окружения. Каталоги (модели, логи, бэкапы, архивы)
     удаляются только по явным флагам.
-    При -PurgeLlamaCpp папки install, logs, Downloads, Backup, Models
-    сохраняются.
 #>
 [CmdletBinding()]
 param(
@@ -103,7 +101,6 @@ $AddToPath     = Get-CfgBool 'service' 'AddToPath'      $true
 $AddNssmToPath = Get-CfgBool 'service' 'AddNssmToPath'  $true
 $Port          = [int](Get-Cfg 'network' 'Port'         '8080')
 
-# Нормализация путей
 if ([string]::IsNullOrWhiteSpace($ModelsDir)) { $ModelsDir = Join-Path $LlamaCppDir 'Models' } elseif (-not [IO.Path]::IsPathRooted($ModelsDir)) { $ModelsDir = Join-Path $LlamaCppDir $ModelsDir }
 if ([string]::IsNullOrWhiteSpace($LogsDir)) { $LogsDir = Join-Path $LlamaCppDir 'logs' } elseif (-not [IO.Path]::IsPathRooted($LogsDir)) { $LogsDir = Join-Path $LlamaCppDir $LogsDir }
 if ([string]::IsNullOrWhiteSpace($DownloadsDir)) { $DownloadsDir = Join-Path $LlamaCppDir 'Downloads' } elseif (-not [IO.Path]::IsPathRooted($DownloadsDir)) { $DownloadsDir = Join-Path $LlamaCppDir $DownloadsDir }
@@ -113,7 +110,7 @@ $ModelsDir    = [IO.Path]::GetFullPath($ModelsDir)
 $LogsDir      = [IO.Path]::GetFullPath($LogsDir)
 $DownloadsDir = [IO.Path]::GetFullPath($DownloadsDir)
 $BackupDir    = [IO.Path]::GetFullPath($BackupDir)
-$InstallPath  = [IO.Path]::GetFullPath((Join-Path $LlamaCppDir 'install'))
+$InstallPath  = [IO.Path]::GetFullPath($scriptDir)
 
 function Write-Step([string]$msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 function Confirm-Action([string]$Prompt) {
