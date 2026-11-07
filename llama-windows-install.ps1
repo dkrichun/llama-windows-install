@@ -4,13 +4,10 @@
     Развёртывание и обновление llama.cpp в режиме Router как службы Windows.
 
 .DESCRIPTION
-    Читает llama-windows-install.ini. Позволяет выбрать версию, сделать бэкап и
-    пересоздать службу. Поддерживает флаг -Upgrade для автообновления.
-    В отличие от single-model режима, запускает llama-server без --model,
-    с --models-dir и --models-max 1, что включает Router.
-    При установке предлагает выбрать модели; для выбранных генерируется
-    preset.ini с hf-repo, и Router автоматически скачивает их при первом запросе.
-    Папки Install, logs, Downloads, Backup, Models сохраняются.
+    Читает llama-windows-install.ini. Запускает llama-server без --model,
+    с --models-dir и --models-max 1 (Router). При установке предлагает выбрать
+    модели; для выбранных генерируется preset.ini с hf-repo/hf-file, и можно
+    сразу скачать их с прогресс-баром. Иначе Router скачает при первом запросе.
 #>
 [CmdletBinding()]
 param(
@@ -126,12 +123,10 @@ $AddToPath        = Get-CfgBool 'service'   'AddToPath'          $true
 $AddNssmToPath    = Get-CfgBool 'service'   'AddNssmToPath'      $true
 $LogRetentionDays = Get-CfgInt  'service'   'LogRetentionDays'   7
 $HostOnly         = Get-Cfg     'network'   'Host'               '0.0.0.0'
-$Port             = Get-CfgInt  'network'   'Port'               8080
+$Port             = Get-CfgInt  'network'   'Port'               9931
 $FirewallEnabled  = Get-CfgBool 'network'   'FirewallEnabled'    $true
 $FirewallSubnet   = Get-Cfg     'network'   'FirewallSubnet'     '192.168.117.0/24'
 $LlamaCppVersion  = Get-Cfg     'downloads' 'LlamaCppVersion'    'ask'
-$LlamaCppUrlFallback = Get-Cfg  'downloads' 'LlamaCppUrl'        'https://github.com/ggml-org/llama.cpp/releases/download/b12184/llama-b12184-bin-win-cuda-13.5-x64.zip'
-$CudartUrlFallback   = Get-Cfg  'downloads' 'CudartUrl'          'https://github.com/ggml-org/llama.cpp/releases/download/b12184/cudart-llama-bin-win-cuda-13.5-x64.zip'
 $NssmUrl          = Get-Cfg     'downloads' 'NssmUrl'            'https://github.com/dkxce/NSSM/releases/download/v2.25/NSSM_v2.25.zip'
 $KeepDownloads    = Get-CfgBool 'downloads' 'KeepDownloads'      $true
 
@@ -146,6 +141,7 @@ $ForceCPU         = Get-CfgBool 'server'    'ForceCPU'           $false
 # Параметры моделей
 $InteractiveModels = Get-CfgBool 'models'   'Interactive'        $true
 $ModelsSpec        = Get-Cfg     'models'   'Models'             ''
+$PreDownload       = Get-CfgBool 'models'   'PreDownload'        $true
 
 if ($Upgrade) {
     Write-Log "  [Upgrade] Автообновление: выбор версии отключён, будет установлена latest." -Color Magenta
@@ -194,26 +190,439 @@ $protectedPaths = @(
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# ─── 3. Вспомогательные функции (большинство — без изменений) ───
-# (функции Stop-LlamaProcesses, Set-LlamaAcl, Get-FileNameFromUrl, Get-CachedFile,
-#  Add-ToMachinePath, Add-NssmToMachinePath, Get-LlamaReleases, Select-LlamaVersionInteractive,
-#  Resolve-LlamaVersion, Test-VCRedist, Install-VCRedist, Test-CudaCompatibility,
-#  Test-LlamaServeDirect, Start-LlamaService — оставлены без изменений, кроме Test-LlamaHealth
-#  и добавления новых функций для работы с моделями)
+# ─── 3. Вспомогательные функции ───
 
-# ... (здесь должны быть все перечисленные функции из предыдущей версии;
-#      для краткости они не повторяются, но в полном файле они присутствуют) ...
+function Stop-LlamaProcesses {
+    Write-Log "  → Завершение процессов llama.cpp..."
+    foreach ($procName in @("llama-server", "llama-server.exe")) {
+        Get-Process -Name $procName -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Log "    Убит процесс: $($_.Name) (PID: $($_.Id))"
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Start-Sleep -Seconds 2
+}
 
-# ─── Новая функция: интерактивный выбор моделей ───
+function Set-LlamaAcl {
+    param([string]$LlamaCppDir, [string]$ModelsDir)
+    foreach ($dir in @($LlamaCppDir, $ModelsDir)) {
+        if ((Test-Path $dir) -and $dir) {
+            icacls $dir /grant '*S-1-5-18:(OI)(CI)F' /T 2>&1 | Out-Null
+            icacls $dir /grant '*S-1-5-32-544:(OI)(CI)F' /T 2>&1 | Out-Null
+        }
+    }
+}
+
+function Get-FileNameFromUrl {
+    param([string]$Url, [string]$Fallback = 'download.bin')
+    try {
+        $uri  = [Uri]$Url
+        $name = [IO.Path]::GetFileName($uri.AbsolutePath)
+        if (-not [string]::IsNullOrWhiteSpace($name)) { return $name }
+    } catch { }
+    return $Fallback
+}
+
+function Get-CachedFile {
+    param([string]$Url, [string]$FileName, [string]$SubDir = '', [switch]$ForceRedownload)
+    $targetDir = if ([string]::IsNullOrWhiteSpace($SubDir)) { $DownloadsDir } else { Join-Path $DownloadsDir $SubDir }
+    if (-not (Test-Path -LiteralPath $targetDir)) {
+        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+    }
+    $cachePath = Join-Path $targetDir $FileName
+    $urlStamp  = "$cachePath.url"
+
+    if ($KeepDownloads -and -not $ForceRedownload) {
+        if ((Test-Path -LiteralPath $cachePath) -and (Test-Path -LiteralPath $urlStamp)) {
+            $cachedUrl = ''
+            try { $cachedUrl = (Get-Content -LiteralPath $urlStamp -Raw -ErrorAction Stop).Trim() } catch { }
+            if ($cachedUrl -eq $Url) {
+                $sizeMb = [math]::Round((Get-Item -LiteralPath $cachePath).Length / 1MB, 1)
+                Write-Log "  ✓ Кэш: $cachePath ($sizeMb MB)" -Color Green
+                return $cachePath
+            }
+        }
+    }
+
+    if (Test-Path -LiteralPath $cachePath) { Remove-Item -LiteralPath $cachePath -Force }
+    if (Test-Path -LiteralPath $urlStamp)  { Remove-Item -LiteralPath $urlStamp  -Force }
+    Write-Log "  → Скачивание: $Url"
+    Invoke-WebRequest -Uri $Url -OutFile $cachePath -UseBasicParsing
+    if ($KeepDownloads) { Set-Content -LiteralPath $urlStamp -Value $Url -NoNewline }
+    return $cachePath
+}
+
+function Add-ToMachinePath {
+    param([string]$Dir)
+    $current = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    if ($null -eq $current) { $current = '' }
+    $parts = $current -split ';' | Where-Object { $_ -ne '' }
+    $normalized = $parts | ForEach-Object { $_.TrimEnd('\') }
+    if ($normalized -contains $Dir.TrimEnd('\')) {
+        Write-Log "  ℹ Уже в PATH: $Dir (пропускаем)" -Color DarkGray
+        return
+    }
+    $new = if ($current.TrimEnd(';') -eq '') { $Dir } else { $current.TrimEnd(';') + ';' + $Dir }
+    [Environment]::SetEnvironmentVariable('Path', $new, 'Machine')
+    Write-Log "  ✓ Добавлено в PATH: $Dir" -Color Green
+    Write-Log "  ℹ Изменения вступят в силу в новых консолях" -Color DarkGray
+}
+
+function Add-NssmToMachinePath {
+    param([string]$NssmDir)
+    if (-not $AddNssmToPath) {
+        Write-Log "  ℹ AddNssmToPath=false — NSSM в PATH не добавляем" -Color DarkGray
+        return
+    }
+    foreach ($sub in @('win32','win64')) {
+        $p = Join-Path $NssmDir $sub
+        if (Test-Path -LiteralPath (Join-Path $p 'nssm.exe')) {
+            Add-ToMachinePath -Dir $p
+        } else {
+            Write-Log "  ℹ Пропуск: $p\nssm.exe не найден" -Color DarkGray
+        }
+    }
+}
+
+function Get-LlamaReleases {
+    param([switch]$ForceRefresh)
+    $cacheFile = Join-Path $DownloadsDir '.llama_releases_cache.json'
+    $cacheTtl  = 12 * 60 * 60
+
+    if (-not $ForceRefresh -and (Test-Path -LiteralPath $cacheFile)) {
+        $age = (Get-Date) - (Get-Item -LiteralPath $cacheFile).LastWriteTime
+        if ($age.TotalSeconds -lt $cacheTtl) {
+            try { return (Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json) } catch { }
+        }
+    }
+
+    $headers = @{ 'User-Agent' = 'PowerShell-LlamaCpp-Deploy-Script'; 'Accept' = 'application/vnd.github+json' }
+    try {
+        $releases = Invoke-RestMethod -Uri 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30' -Headers $headers -ErrorAction Stop
+        if (-not (Test-Path -LiteralPath $DownloadsDir)) {
+            New-Item -ItemType Directory -Path $DownloadsDir -Force | Out-Null
+        }
+        $releases | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cacheFile -Encoding UTF8
+        return $releases
+    } catch {
+        Write-Log "  ✗ Не удалось получить список релизов: $($_.Exception.Message)" -Color Yellow
+        if (Test-Path -LiteralPath $cacheFile) { return (Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json) }
+        return $null
+    }
+}
+
+function Select-LlamaVersionInteractive {
+    param($Releases, [string]$CurrentVersion)
+    if (-not $Releases) { return $null }
+
+    $list = @($Releases | Select-Object -First 15)
+    if ($list.Count -eq 0) {
+        Write-Log '  Нет доступных версий для установки.' -Color Yellow
+        return $null
+    }
+
+    Write-Log ''
+    Write-Log 'Доступные версии llama.cpp:' -Color Cyan
+    for ($i = 0; $i -lt $list.Count; $i++) {
+        $date = if ($list[$i].published_at) { ([datetime]$list[$i].published_at).ToString('yyyy-MM-dd') } else { '—' }
+        $mark = if ($CurrentVersion -and $list[$i].tag_name -eq $CurrentVersion) { ' <-- текущая (переустановка)' } else { '' }
+        $color = if ($mark) { 'Yellow' } else { 'White' }
+        Write-Log ('  [{0}] {1,-16} {2}  {3}' -f ($i+1), $list[$i].tag_name, $date, $mark) -Color $color
+    }
+    Write-Log ''
+
+    while ($true) {
+        Write-Host 'Введите номер версии (Enter — последняя, s — отмена):' -ForegroundColor Cyan
+        $ans = (Read-Host 'Выбор').Trim()
+
+        if ([string]::IsNullOrWhiteSpace($ans)) { return $list[0] }
+        if ($ans -match '^[scысSCЫС]$') { return 'CANCEL' }
+
+        $n = 0
+        if ([int]::TryParse($ans, [ref]$n) -and $n -ge 1 -and $n -le $list.Count) {
+            return $list[$n-1]
+        }
+        Write-Log "  Некорректный ввод: '$ans'. Введите число от 1 до $($list.Count), 's' для отмены или Enter." -Color Yellow
+    }
+}
+
+function Resolve-LlamaVersion {
+    param([string]$RequestedVersion, [string]$CurrentVersion, [switch]$ForceRefresh)
+
+    if ($RequestedVersion -match '^b\d+$') { return $RequestedVersion }
+
+    $releases = Get-LlamaReleases -ForceRefresh:$ForceRefresh
+    if (-not $releases) { return $null }
+
+    if ($RequestedVersion -eq 'ask' -and -not $Force) {
+        $sel = Select-LlamaVersionInteractive -Releases $releases -CurrentVersion $CurrentVersion
+        if ($sel -is [string] -and $sel -eq 'CANCEL') { return 'CANCEL' }
+        if ($null -eq $sel) { return $null }
+        if ($sel.tag_name) { return $sel.tag_name }
+        return $null
+    }
+
+    $latest = @($releases | Where-Object { $_.tag_name -match '^b\d+$' }) | Select-Object -First 1
+    if ($latest) { return $latest.tag_name }
+    return $null
+}
+
+function Test-LlamaHealth {
+    param([string]$Url, [int]$TimeoutSec = 5)
+    try {
+        $resp = Invoke-RestMethod -Uri $Url -TimeoutSec $TimeoutSec -ErrorAction Stop
+        return ($resp.status -eq 'ok')
+    } catch { return $false }
+}
+
+function Test-VCRedist {
+    $regPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64'
+    )
+    foreach ($path in $regPaths) {
+        if (Test-Path $path) {
+            $ver = (Get-ItemProperty $path -ErrorAction SilentlyContinue).Version
+            if ($ver) {
+                Write-Log "  ✓ Visual C++ Redistributable найден (версия $ver)" -Color Green
+                return $true
+            }
+        }
+    }
+    Write-Log "  ✗ Visual C++ Redistributable (x64) не найден!" -Color Red
+    return $false
+}
+
+function Install-VCRedist {
+    $url = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+    $outFile = Join-Path $env:TEMP 'vc_redist.x64.exe'
+    Write-Log "  → Скачивание Visual C++ Redistributable..." -Color Cyan
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing
+        Write-Log "  → Установка (тихий режим)..." -Color Cyan
+        $p = Start-Process -FilePath $outFile -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru -NoNewWindow
+        Write-Log "  → Код возврата: $($p.ExitCode)" -Color DarkGray
+        if ($p.ExitCode -in @(0, 1638, 3010)) {
+            Write-Log "  ✓ Visual C++ Redistributable установлен." -Color Green
+            return $true
+        }
+        Write-Log "  ✗ Установка завершилась с кодом $($p.ExitCode)" -Color Red
+        return $false
+    } catch {
+        Write-Log "  ✗ Ошибка установки VC++ Redist: $_" -Color Red
+        return $false
+    } finally {
+        if (Test-Path $outFile) { Remove-Item $outFile -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Test-CudaCompatibility {
+    param([string]$RequiredVersion)
+    if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
+        $smiPath = Join-Path $env:ProgramFiles 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'
+        if (Test-Path $smiPath) {
+            $nvidiaSmi = $smiPath
+        } else {
+            Write-Log "  ✗ nvidia-smi не найден. Драйвер NVIDIA не установлен." -Color Red
+            return $false
+        }
+    } else {
+        $nvidiaSmi = 'nvidia-smi'
+    }
+
+    try {
+        $smiOut = & $nvidiaSmi 2>&1 | Out-String
+    } catch {
+        Write-Log "  ✗ Не удалось запустить nvidia-smi: $_" -Color Red
+        return $false
+    }
+
+    $cudaVerStr = $null
+    if ($smiOut -match 'CUDA\s+(?:UMD\s+)?Version:\s*(\d+(?:\.\d+)?)') {
+        $cudaVerStr = $matches[1]
+    }
+
+    if (-not $cudaVerStr) {
+        Write-Log "  ✗ Не удалось распарсить версию CUDA из nvidia-smi" -Color Red
+        return $false
+    }
+
+    $cudaMajor = [int]$cudaVerStr.Split('.')[0]
+
+    $vramMb = $null
+    if ($smiOut -match '(\d+)MiB\s*/\s*(\d+)MiB') {
+        $vramMb = [int]$matches[2]
+    }
+
+    $reqVerStr = $RequiredVersion -replace '^cuda-',''
+    $reqMajor = [int]$reqVerStr.Split('.')[0]
+
+    Write-Log "  ℹ Драйвер поддерживает CUDA $cudaVerStr (требуется >= $reqMajor.x)" -Color DarkGray
+    if ($vramMb) {
+        Write-Log "  ℹ VRAM: $vramMb MiB" -Color DarkGray
+        if ($vramMb -lt 8000) {
+            Write-Log "  ⚠ Мало VRAM ($vramMb MiB). Рекомендуется -ngl <= 30, CtxSize <= 4096" -Color Yellow
+        }
+    }
+
+    if ($cudaMajor -ge $reqMajor) {
+        Write-Log "  ✓ Версия CUDA совместима." -Color Green
+        return $true
+    }
+    Write-Log "  ✗ Версия CUDA несовместима! Требуется $reqMajor.x, обнаружена $cudaVerStr" -Color Red
+    return $false
+}
+
+function Test-LlamaServeDirect {
+    param([string]$Exe, [string]$Args, [int]$WaitSec = 15)
+    Write-Log "  → Прямой запуск llama-server.exe ($WaitSec сек)..."
+    Write-Log "    Аргументы: $Args"
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = $Args
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.CreateNoWindow = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding  = [Text.Encoding]::UTF8
+
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+
+        $stdoutSb = New-Object System.Text.StringBuilder
+        $stderrSb = New-Object System.Text.StringBuilder
+        $outEvent = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action {
+            if ($EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
+        } -MessageData $stdoutSb
+        $errEvent = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -Action {
+            if ($EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
+        } -MessageData $stderrSb
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+
+        Start-Sleep -Seconds $WaitSec
+        $exited = $proc.HasExited
+        $exitCode = if ($exited) { $proc.ExitCode } else { $null }
+
+        Start-Sleep -Milliseconds 500
+
+        Unregister-Event -SourceIdentifier $outEvent.Name -ErrorAction SilentlyContinue
+        Unregister-Event -SourceIdentifier $errEvent.Name -ErrorAction SilentlyContinue
+
+        if (-not $exited) {
+            Write-Log "    ✓ Процесс РАБОТАЕТ после $WaitSec сек" -Color Green
+            try { $proc.Kill() } catch {}
+            try { $proc.WaitForExit(3000) | Out-Null } catch {}
+        } else {
+            Write-Log "    ✗ Процесс УПАЛ с кодом $exitCode" -Color Red
+        }
+
+        $stdout = $stdoutSb.ToString()
+        $stderr = $stderrSb.ToString()
+
+        if ($stderr -and $stderr.Trim()) {
+            Write-Log "    STDERR:" -Color Yellow
+            $stderr -split "`n" | Select-Object -First 40 | ForEach-Object { Write-Log "      $_" -Color DarkGray }
+        }
+        if ($stdout -and $stdout.Trim()) {
+            Write-Log "    STDOUT (первые 30 строк):" -Color Yellow
+            $stdout -split "`n" | Select-Object -First 30 | ForEach-Object { Write-Log "      $_" -Color DarkGray }
+        }
+        return ($exited -eq $false)
+    } catch {
+        Write-Log "    Не удалось запустить тест: $_" -Color Red
+        return $false
+    }
+}
+
+function Start-LlamaService {
+    param([string]$NssmExe, [string]$ServiceName, [int]$TimeoutSec, [int]$MaxAttempts = 3)
+    $started = $false
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Write-Log "  → Попытка запуска $attempt из $MaxAttempts..."
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $svc) { throw "Служба $ServiceName не найдена после установки" }
+        if ($svc.Status -eq 'Running') { $started = $true; break }
+        & $NssmExe start $ServiceName 2>&1 | Out-Null
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastStatus = ''
+        while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+            $svc.Refresh()
+            $status = $svc.Status
+            if ($status -ne $lastStatus) {
+                Write-Log "    Статус: $status"
+                $lastStatus = $status
+            }
+            if ($status -eq 'Running') { $started = $true; break }
+            if ($status -eq 'Stopped' -and $sw.Elapsed.TotalSeconds -gt 3) {
+                Write-Log "  ⚠ Служба упала через $([int]$sw.Elapsed.TotalSeconds) сек после запуска" -Color Yellow
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        if ($started) { break }
+        if ($attempt -lt $MaxAttempts) {
+            Write-Log "  → Пауза 5 сек перед повтором..."
+            Start-Sleep -Seconds 5
+        }
+    }
+    if ($started) {
+        Write-Log "  ✓ Статус: Running" -Color Green
+        return $true
+    }
+
+    Write-Log ""
+    Write-Log "Служба не запустилась за $MaxAttempts × $TimeoutSec сек." -Color Yellow
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($svc) { Write-Log "  Текущий статус : $($svc.Status)" -Color Yellow }
+    try {
+        $svcInfo = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+        if ($svcInfo -and $null -ne $svcInfo.ExitCode) {
+            Write-Log "  ExitCode       : $($svcInfo.ExitCode)" -Color Yellow
+        }
+    } catch {}
+    foreach ($logFile in @(
+        (Join-Path $LogsDir 'llama-server.err.log'),
+        (Join-Path $LogsDir 'llama-server.out.log')
+    ) | Select-Object -Unique) {
+        if (Test-Path $logFile) {
+            $lines = @(Get-Content $logFile -Tail 20 -ErrorAction SilentlyContinue)
+            if ($lines.Count -gt 0) {
+                Write-Log "`n  Файл $logFile (последние строки):" -Color Yellow
+                $lines | ForEach-Object { Write-Log "    $_" -Color DarkGray }
+            }
+        }
+    }
+    Write-Log "`n  nssm dump $ServiceName :" -Color Yellow
+    try {
+        $oemCodePage = 866
+        try {
+            $oemCp = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+            if ($oemCp -gt 0) { $oemCodePage = [int]$oemCp }
+        } catch { }
+        $origOutputEncoding = [Console]::OutputEncoding
+        try {
+            [Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding($oemCodePage)
+            & $NssmExe dump $ServiceName 2>&1 | ForEach-Object { Write-Log "    $_" -Color DarkGray }
+        } finally {
+            [Console]::OutputEncoding = $origOutputEncoding
+        }
+    } catch {}
+    return $false
+}
+
 function Select-ModelsInteractive {
     param([string[]]$Preselected)
+    if ($null -eq $Preselected) { $Preselected = @() }
 
     $menu = @(
-        [pscustomobject]@{ Name='qwen7b';   HfRepo='bartowski/Qwen2.5-7B-Instruct-GGUF'; Quant='Q4_K_M'; Desc='Qwen2.5 7B · ≈ 4.7 ГБ' }
-        [pscustomobject]@{ Name='llama8b';  HfRepo='bartowski/Meta-Llama-3.1-8B-Instruct-GGUF'; Quant='Q4_K_M'; Desc='Llama 3.1 8B · ≈ 4.9 ГБ' }
-        [pscustomobject]@{ Name='coder7b';  HfRepo='bartowski/Qwen2.5-Coder-7B-Instruct-GGUF'; Quant='Q4_K_M'; Desc='Qwen2.5 Coder 7B · ≈ 4.7 ГБ' }
-        [pscustomobject]@{ Name='gemma2b';  HfRepo='bartowski/gemma-2-2b-it-GGUF'; Quant='Q4_K_M'; Desc='Gemma 2 2B · ≈ 1.6 ГБ' }
-        [pscustomobject]@{ Name='deepseek8b'; HfRepo='bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF'; Quant='Q4_K_M'; Desc='DeepSeek R1 8B · ≈ 4.9 ГБ' }
+        [pscustomobject]@{ Name='qwen7b';     HfRepo='bartowski/Qwen2.5-7B-Instruct-GGUF';             HfFile='Qwen2.5-7B-Instruct-Q4_K_M.gguf';             Desc='Qwen2.5 7B · ≈ 4.7 ГБ' }
+        [pscustomobject]@{ Name='llama8b';    HfRepo='bartowski/Meta-Llama-3.1-8B-Instruct-GGUF';     HfFile='Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf';      Desc='Llama 3.1 8B · ≈ 4.9 ГБ' }
+        [pscustomobject]@{ Name='coder7b';    HfRepo='bartowski/Qwen2.5-Coder-7B-Instruct-GGUF';      HfFile='Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf';       Desc='Qwen2.5 Coder 7B · ≈ 4.7 ГБ' }
+        [pscustomobject]@{ Name='gemma2b';    HfRepo='bartowski/gemma-2-2b-it-GGUF';                  HfFile='gemma-2-2b-it-Q4_K_M.gguf';                   Desc='Gemma 2 2B · ≈ 1.6 ГБ' }
+        [pscustomobject]@{ Name='deepseek8b'; HfRepo='bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF';  HfFile='DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf';    Desc='DeepSeek R1 8B · ≈ 4.9 ГБ' }
     )
 
     Write-Log ''
@@ -228,9 +637,9 @@ function Select-ModelsInteractive {
     Write-Log "  'a' — все, 'n' — пропустить, Enter — оставить предвыбранные:" -Color Cyan
 
     $ans = Read-Host 'Выбор'
-    if ([string]::IsNullOrWhiteSpace($ans)) { return $Preselected }
+    if ([string]::IsNullOrWhiteSpace($ans)) { return @($Preselected) }
     if ($ans -eq 'n') { return @() }
-    if ($ans -eq 'a') { return $menu | ForEach-Object { $_.Name } }
+    if ($ans -eq 'a') { return @($menu | ForEach-Object { $_.Name }) }
 
     $selected = @()
     foreach ($part in ($ans -split ',')) {
@@ -243,17 +652,17 @@ function Select-ModelsInteractive {
             Write-Log "  Пропущено: '$p' (не число или вне диапазона 1..$($menu.Count))" -Color Yellow
         }
     }
-    return $selected
+    return @($selected)
 }
 
 function Get-PresetEntry {
     param([string]$Name)
     $menu = @{
-        'qwen7b'   = @{ HfRepo='bartowski/Qwen2.5-7B-Instruct-GGUF'; Quant='Q4_K_M' }
-        'llama8b'  = @{ HfRepo='bartowski/Meta-Llama-3.1-8B-Instruct-GGUF'; Quant='Q4_K_M' }
-        'coder7b'  = @{ HfRepo='bartowski/Qwen2.5-Coder-7B-Instruct-GGUF'; Quant='Q4_K_M' }
-        'gemma2b'  = @{ HfRepo='bartowski/gemma-2-2b-it-GGUF'; Quant='Q4_K_M' }
-        'deepseek8b' = @{ HfRepo='bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF'; Quant='Q4_K_M' }
+        'qwen7b'     = @{ HfRepo='bartowski/Qwen2.5-7B-Instruct-GGUF';            HfFile='Qwen2.5-7B-Instruct-Q4_K_M.gguf' }
+        'llama8b'    = @{ HfRepo='bartowski/Meta-Llama-3.1-8B-Instruct-GGUF';    HfFile='Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf' }
+        'coder7b'    = @{ HfRepo='bartowski/Qwen2.5-Coder-7B-Instruct-GGUF';     HfFile='Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf' }
+        'gemma2b'    = @{ HfRepo='bartowski/gemma-2-2b-it-GGUF';                 HfFile='gemma-2-2b-it-Q4_K_M.gguf' }
+        'deepseek8b' = @{ HfRepo='bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF'; HfFile='DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf' }
     }
     return $menu[$Name]
 }
@@ -263,19 +672,126 @@ function New-ModelsPreset {
     $lines = @()
     foreach ($name in $ModelNames) {
         $entry = Get-PresetEntry -Name $name
-        if (-not $entry) { continue }
+        if (-not $entry) {
+            Write-Log "  ⚠ Неизвестное имя модели: $name (пропущено)" -Color Yellow
+            continue
+        }
         $lines += "[$name]"
         $lines += "hf-repo = $($entry.HfRepo)"
-        $lines += "hf-file = $name-$($entry.Quant).gguf"
-        $lines += "ctx-size = $CtxSize"
-        $lines += "n-gpu-layers = $NGpuLayers"
-        if ($FlashAttention) { $lines += "flash-attn = on" }
-        $lines += "parallel = $Parallel"
+        $lines += "hf-file = $($entry.HfFile)"
         $lines += ""
     }
     $lines | Set-Content -LiteralPath $PresetPath -Encoding UTF8
     Write-Log "  ✓ Создан preset-файл: $PresetPath" -Color Green
     Write-Log "    Модели: $($ModelNames -join ', ')" -Color DarkGray
+}
+
+function Invoke-ModelDownload {
+    param(
+        [string]$Url,
+        [string]$Destination,
+        [string]$DisplayName,
+        [switch]$NoProgress
+    )
+
+    Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+
+    if (Test-Path -LiteralPath $Destination) {
+        $existingSize = (Get-Item -LiteralPath $Destination).Length
+        if ($existingSize -gt 0) {
+            $sizeMb = [math]::Round($existingSize / 1MB, 1)
+            Write-Log "  ✓ Уже скачано: $Destination ($sizeMb MB) — пропускаем" -Color Green
+            return $true
+        }
+    }
+
+    $partFile = "$Destination.part"
+    $resumeFrom = 0
+    if (Test-Path -LiteralPath $partFile) {
+        $resumeFrom = (Get-Item -LiteralPath $partFile).Length
+        if ($resumeFrom -gt 0) {
+            Write-Log "  → Докачка с $([math]::Round($resumeFrom/1MB,1)) MB (найден .part)" -Color DarkGray
+        }
+    }
+
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromHours(4)
+    $client.DefaultRequestHeaders.Add('User-Agent', 'PowerShell-LlamaCpp-Deploy')
+
+    try {
+        $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $Url)
+        if ($resumeFrom -gt 0) {
+            $request.Headers.Range = New-Object System.Net.Http.Headers.RangeHeaderValue -ArgumentList $resumeFrom, $null
+        }
+
+        Write-Log "  → Скачивание: $Url"
+        $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
+        $response.EnsureSuccessStatusCode()
+
+        $totalBytes = $null
+        if ($response.Content.Headers.ContentLength) {
+            $totalBytes = [long]$response.Content.Headers.ContentLength
+        }
+        if ($resumeFrom -gt 0 -and $totalBytes) {
+            $totalBytes += $resumeFrom
+        }
+
+        $fileMode = if ($resumeFrom -gt 0) { [System.IO.FileMode]::Append } else { [System.IO.FileMode]::Create }
+        $fileStream = New-Object System.IO.FileStream($partFile, $fileMode, [System.IO.FileAccess]::Write)
+        $httpStream = $response.Content.ReadAsStreamAsync().Result
+
+        $buffer = New-Object byte[] 81920
+        $totalRead = $resumeFrom
+        $lastUpdate = [DateTime]::MinValue
+
+        try {
+            while (($read = $httpStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $fileStream.Write($buffer, 0, $read)
+                $totalRead += $read
+
+                $now = [DateTime]::Now
+                if (-not $NoProgress -and ($now - $lastUpdate).TotalMilliseconds -ge 200) {
+                    $readMb = [math]::Round($totalRead / 1MB, 1)
+                    if ($totalBytes -gt 0) {
+                        $totalMb = [math]::Round($totalBytes / 1MB, 1)
+                        $percent = [int](($totalRead / $totalBytes) * 100)
+                        if ($percent -gt 100) { $percent = 100 }
+                        Write-Progress -Activity "Скачивание $DisplayName" `
+                            -Status "$readMb / $totalMb MB ($percent%)" `
+                            -PercentComplete $percent
+                    } else {
+                        Write-Progress -Activity "Скачивание $DisplayName" -Status "$readMb MB"
+                    }
+                    $lastUpdate = $now
+                }
+            }
+        } finally {
+            $fileStream.Close()
+            $httpStream.Close()
+        }
+
+        if (-not $NoProgress) { Write-Progress -Activity "Скачивание $DisplayName" -Completed }
+
+        if ($totalBytes -gt 0) {
+            $actualSize = (Get-Item -LiteralPath $partFile).Length
+            if ($actualSize -ne $totalBytes) {
+                throw "Размер файла не совпадает: ожидалось $totalBytes, получено $actualSize"
+            }
+        }
+
+        if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force }
+        Move-Item -LiteralPath $partFile -Destination $Destination -Force
+
+        $finalMb = [math]::Round((Get-Item -LiteralPath $Destination).Length / 1MB, 1)
+        Write-Log "  ✓ Скачано: $Destination ($finalMb MB)" -Color Green
+        return $true
+    } catch {
+        Write-Log "  ✗ Ошибка скачивания $DisplayName : $_" -Color Red
+        Write-Log "  ℹ Частичный файл сохранён: $partFile (докачается при повторном запуске)" -Color DarkGray
+        return $false
+    } finally {
+        $client.Dispose()
+    }
 }
 
 # ─── 4. Основной блок try ───
@@ -284,13 +800,16 @@ try {
     $currentVersion = $null
 
     if (Test-Path $llamaServerExe) {
-        $verOut = (& $llamaServerExe --version 2>&1) -join ' '
-        if ($verOut -match 'version:\s*(\d+)\s*\(([0-9a-f]+)\)') {
+        $verOut = ''
+        try { $verOut = (& $llamaServerExe --version 2>&1) -join ' ' } catch { }
+        if ($verOut -match 'version:\s*b?(\d{3,})') {
             $currentVersion = "b$($matches[1])"
             Write-Log "`n  ℹ Обнаружена установленная версия: $currentVersion" -Color Green
-        } elseif ($verOut -match 'b(\d+)') {
+        } elseif ($verOut -match '\bb(\d{3,})\b') {
             $currentVersion = "b$($matches[1])"
             Write-Log "`n  ℹ Обнаружена установленная версия: $currentVersion" -Color Green
+        } else {
+            Write-Log "`n  ℹ Версию установить не удалось. Вывод: $verOut" -Color DarkGray
         }
     } else {
         Write-Log "`n  ℹ llama.cpp не установлен — будет выполнена первичная установка." -Color Cyan
@@ -353,7 +872,7 @@ try {
     Write-Log "    • Целевая версия : $targetVersion"
     Write-Log "    • Режим          : $(if($isReinstall){'переустановка'} elseif($isUpgrade){'обновление/даунгрейд'} else {'первичная установка'})"
     Write-Log "    • Бэкап          : $(if($needsBackup){'будет создан'} else {'не требуется'})"
-    Write-Log "    • Router mode    : --models-dir $ModelsDir --models-max 1"
+    Write-Log "    • Router mode    : --models-dir $ModelsDir --models-max 1 --port $Port"
     Write-Log "    • ForceCPU       : $ForceCPU"
 
     if (-not $Force -and $needsBackup) {
@@ -375,14 +894,11 @@ try {
     }
     Stop-LlamaProcesses
 
-    # ─── Проверка зависимостей (VC++, CUDA, порт) ───
     Write-Step "Проверка системных зависимостей"
-
     if (-not (Test-VCRedist)) {
         Write-Log "  → Попытка автоматической установки..." -Color Yellow
         if (-not (Install-VCRedist)) {
             Write-Log "  ⚠ Не удалось установить VC++ Redist автоматически." -Color Yellow
-            Write-Log "  ⚠ Установите вручную: https://aka.ms/vs/17/release/vc_redist.x64.exe" -Color Yellow
             if (-not $Force) {
                 $ans = Read-Host 'Продолжить установку? [y/N]'
                 if ($ans -ne 'y') { throw 'Отменено пользователем (нет VC++ Redist)' }
@@ -396,15 +912,14 @@ try {
     if ($useGpu) {
         $cudaRequired = if ($llamaDownloadUrl -match 'cuda-(\d+\.\d+)') { $matches[1] } else { '13.5' }
         if (-not (Test-CudaCompatibility -RequiredVersion $cudaRequired)) {
-            Write-Log "  ⚠ CUDA несовместима или не найдена. Служба может не запуститься." -Color Yellow
-            Write-Log "  ℹ Установите ForceCPU=true в INI, чтобы запустить без GPU." -Color Yellow
+            Write-Log "  ⚠ CUDA несовместима или не найдена." -Color Yellow
             if (-not $Force) {
                 $ans = Read-Host 'Продолжить установку с GPU? [y/N]'
                 if ($ans -ne 'y') { throw 'Отменено пользователем (CUDA)' }
             }
         }
     } else {
-        Write-Log "  ℹ ForceCPU=true — проверка CUDA пропущена, служба будет запущена без GPU." -Color DarkGray
+        Write-Log "  ℹ ForceCPU=true — проверка CUDA пропущена." -Color DarkGray
     }
 
     Write-Step "Проверка порта $Port"
@@ -467,7 +982,6 @@ try {
                 Copy-Item -Path $item.FullName -Destination $backupPath -Recurse -Force
             }
             Write-Log "  ✓ Резервная копия создана: $backupPath" -Color Green
-            Write-Log "  ℹ Папки Install, logs, Downloads, Backup, Models не копировались" -Color DarkGray
         } catch {
             throw "Не удалось создать резервную копию (файлы заняты?). Ошибка: $_"
         }
@@ -486,7 +1000,7 @@ try {
     }
 
     if ($LogRetentionDays -gt 0 -and (Test-Path $LogsDir)) {
-        Write-Log "  → Ротация логов: удаление файлов старше $LogRetentionDays дней из $LogsDir" -Color DarkGray
+        Write-Log "  → Ротация логов: удаление файлов старше $LogRetentionDays дней" -Color DarkGray
         $cutoff = (Get-Date).AddDays(-$LogRetentionDays)
         Get-ChildItem -Path $LogsDir -File -ErrorAction SilentlyContinue |
             Where-Object { $_.LastWriteTime -lt $cutoff } |
@@ -529,14 +1043,14 @@ try {
     }
 
     if ($FirewallEnabled -and -not [string]::IsNullOrWhiteSpace($FirewallSubnet)) {
-        Write-Step "Правило брандмауэра ($FirewallSubnet)"
+        Write-Step "Правило брандмауэра ($FirewallSubnet, порт $Port)"
         $ruleName = "LlamaCpp API ($FirewallSubnet)"
         Get-NetFirewallRule -DisplayName "LlamaCpp API*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
         New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort $Port -RemoteAddress $FirewallSubnet -Action Allow -Profile Any | Out-Null
-        Write-Log "  ✓ $ruleName" -Color Green
+        Write-Log "  ✓ $ruleName → TCP $Port" -Color Green
     }
 
-    # ─── Выбор моделей и генерация preset ───
+    # ─── Выбор моделей ───
     $selectedModels = @()
     $presetPath = Join-Path $ModelsDir 'models.ini'
 
@@ -544,12 +1058,12 @@ try {
         Write-Step 'Выбор моделей для автоматической загрузки'
         $preselected = @()
         if (-not [string]::IsNullOrWhiteSpace($ModelsSpec)) {
-            $preselected = $ModelsSpec -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+            $preselected = @($ModelsSpec -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
         }
-        $selectedModels = Select-ModelsInteractive -Preselected $preselected
+        $selectedModels = @(Select-ModelsInteractive -Preselected $preselected)
     } else {
         if (-not [string]::IsNullOrWhiteSpace($ModelsSpec)) {
-            $selectedModels = $ModelsSpec -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+            $selectedModels = @($ModelsSpec -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
         }
         if ($selectedModels.Count -eq 0) {
             Write-Log '  ℹ Модели не заданы — Router запустится без preset.' -Color DarkGray
@@ -564,8 +1078,48 @@ try {
         if (Test-Path $presetPath) { Remove-Item -LiteralPath $presetPath -Force -ErrorAction SilentlyContinue }
     }
 
+    # ─── Предзагрузка моделей с прогресс-баром ───
+    if ($selectedModels.Count -gt 0) {
+        $doPreDownload = $PreDownload
+        if (-not $Force) {
+            Write-Host ""
+            Write-Log 'Скачать модели сейчас (с прогресс-баром)?' -Color Cyan
+            Write-Log '  Y — скачать сейчас (~5–15 мин, зависит от скорости)' -Color DarkGray
+            Write-Log '  n — отложить, Router скачает при первом запросе' -Color DarkGray
+            $ans = Read-Host 'Скачать? [Y/n]'
+            $doPreDownload = ($ans -ne 'n' -and $ans -ne 'N')
+        } elseif ($PreDownload) {
+            Write-Log "  ℹ PreDownload=true — скачиваем модели до запуска службы" -Color DarkGray
+        }
+
+        if ($doPreDownload) {
+            Write-Step 'Скачивание моделей'
+            $downloadResults = @()
+            foreach ($name in $selectedModels) {
+                $entry = Get-PresetEntry -Name $name
+                if (-not $entry) { continue }
+                $modelUrl = "https://huggingface.co/$($entry.HfRepo)/resolve/main/$($entry.HfFile)"
+                $destPath = Join-Path $ModelsDir $entry.HfFile
+                Write-Log ""
+                Write-Log "  → Модель: $name ($($entry.HfFile))" -Color Cyan
+                $ok = Invoke-ModelDownload -Url $modelUrl -Destination $destPath -DisplayName $name
+                $downloadResults += [pscustomobject]@{ Name=$name; Ok=$ok; Path=$destPath }
+            }
+            Write-Log ""
+            $okCount = @($downloadResults | Where-Object { $_.Ok }).Count
+            $failCount = $downloadResults.Count - $okCount
+            Write-Log "  Итог: $okCount скачано, $failCount с ошибкой" -Color $(if ($failCount -eq 0) {'Green'} else {'Yellow'})
+            foreach ($r in $downloadResults) {
+                if (-not $r.Ok) {
+                    Write-Log "    ✗ $($r.Name) — Router попробует скачать при первом запросе" -Color Yellow
+                }
+            }
+        } else {
+            Write-Log "  ℹ Модели будут скачаны Router'ом при первом запросе" -Color DarkGray
+        }
+    }
+
     # ─── Формирование аргументов Router ───
-    # Ключевое отличие: НЕТ --model, но есть --models-dir и --models-max
     $serverArgs = @(
         '--host', $HostOnly,
         '--port', "$Port",
@@ -588,7 +1142,7 @@ try {
     }
     $serverArgsLine = $serverArgs -join ' '
 
-    Write-Step "Регистрация службы $ServiceName (Router mode)"
+    Write-Step "Регистрация службы $ServiceName (Router mode, port $Port)"
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
         Write-Log '  → Остановка старой службы'
         & $nssmExe stop $ServiceName 2>&1 | Out-Null
@@ -603,7 +1157,6 @@ try {
             Start-Sleep -Milliseconds 500
         }
         if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
-            Write-Log "  NSSM не удалил службу, принудительно через sc.exe" -Color Yellow
             & sc.exe delete $ServiceName 2>&1 | Out-Null
             Start-Sleep -Seconds 2
         }
@@ -616,7 +1169,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Ошибка NSSM при установке службы (код $LASTEXITCODE)." }
     & $nssmExe set $ServiceName AppDirectory $LlamaCppDir 2>&1 | Out-Null
     & $nssmExe set $ServiceName Start $StartType 2>&1 | Out-Null
-    & $nssmExe set $ServiceName Description "llama.cpp Router: dynamically loads and downloads GGUF models on demand. Max 1 model in memory." 2>&1 | Out-Null
+    & $nssmExe set $ServiceName Description "llama.cpp Router: dynamically loads GGUF models on demand. Max 1 model in memory." 2>&1 | Out-Null
     & $nssmExe set $ServiceName AppStdout (Join-Path $LogsDir 'llama-server.out.log') 2>&1 | Out-Null
     & $nssmExe set $ServiceName AppStderr (Join-Path $LogsDir 'llama-server.err.log') 2>&1 | Out-Null
     & $nssmExe set $ServiceName AppRotateFiles 1 2>&1 | Out-Null
@@ -648,24 +1201,22 @@ try {
 
         if ($diagCpuOk) {
             Write-Log "`n  ⚠ Процесс работает в режиме CPU, но падает с GPU." -Color Yellow
-            Write-Log "  → Проблема в CUDA/драйвере/VRAM." -Color Yellow
         } elseif ($diagVerboseOk) {
             Write-Log "`n  ⚠ Процесс работает при прямом запуске, но NSSM не запускает." -Color Yellow
-            Write-Log "  → Проблема в конфигурации NSSM." -Color Yellow
         } else {
-            Write-Log "`n  ✗ Процесс падает и при прямом запуске. Смотрите STDERR выше." -Color Red
+            Write-Log "`n  ✗ Процесс падает и при прямом запуске." -Color Red
         }
         throw "Служба $ServiceName не запустилась. Смотрите диагностику выше."
     }
 
-    Write-Step 'Проверка API через /health'
+    Write-Step "Проверка API через /health (порт $Port)"
     $maxAttempts = 40
     $apiOk = $false
     for ($i = 1; $i -le $maxAttempts; $i++) {
         Start-Sleep -Seconds 3
         if (Test-LlamaHealth -Url "http://127.0.0.1:$Port/health") {
             $apiOk = $true
-            Write-Log "  ✓ Попытка ${i}: /health отвечает status=ok (Router запущен, модели ещё не загружены)" -Color Green
+            Write-Log "  ✓ Попытка ${i}: /health отвечает status=ok" -Color Green
             break
         } else {
             Write-Log "  … Попытка ${i}/${maxAttempts}: /health пока не готов"
@@ -673,7 +1224,6 @@ try {
     }
     if (-not $apiOk) {
         Write-Log "/health не ответил за $($maxAttempts * 3) секунд." -Color Yellow
-        Write-Log "Router запускается без модели, поэтому /health должен отвечать быстро. Проверьте логи:" -Color Yellow
         Write-Log "  Get-Content '$LogsDir\llama-server.err.log' -Tail 30" -Color Yellow
     }
 
@@ -682,45 +1232,18 @@ try {
     Write-Log " Развёртывание завершено ($actionLabel, Router mode)" -Color Green
     Write-Log '=============================' -Color Green
     Write-Log " Служба      : $ServiceName"
-    Write-Log " Версия      : $(if($currentVersion){$currentVersion} else {'не была установлена'}) -> $(if($targetVersion){$targetVersion} else {'N/A'})"
+    Write-Log " Версия      : $(if($currentVersion){$currentVersion} else {'—'}) -> $(if($targetVersion){$targetVersion} else {'N/A'})"
     Write-Log " Бинарник    : $llamaServerExe"
     Write-Log " ModelsDir   : $ModelsDir"
     Write-Log " Preset      : $(if($selectedModels.Count -gt 0){$presetPath}else{'(не создан)'})"
     Write-Log " Модели      : $(if($selectedModels.Count -gt 0){$selectedModels -join ', '}else{'(не выбраны)'})"
-    Write-Log " Логи        : $LogsDir"
-    Write-Log " Архивы      : $DownloadsDir\llama_$targetVersion"
-    if ($backupPath) { Write-Log " Бэкап       : $backupPath" } else { Write-Log " Бэкапы      : $BackupDir (не требуется)" }
     Write-Log " API локально: http://127.0.0.1:$Port"
     Write-Log " Health-check: http://127.0.0.1:$Port/health"
-    Write-Log " Режим       : Router (--models-max 1, автозагрузка моделей включена)"
+    Write-Log " Режим       : Router (--models-max 1)"
     Write-Log " Параметры   : CtxSize=$CtxSize, NGpuLayers=$NGpuLayers, FA=$FlashAttention, Parallel=$Parallel, ForceCPU=$ForceCPU"
-
-    if ($FirewallEnabled -and -not [string]::IsNullOrWhiteSpace($FirewallSubnet)) {
-        $localIps = @()
-        try {
-            $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.|0\.)' -and $_.PrefixOrigin -ne 'WellKnown' }
-            foreach ($ip in $ips) {
-                $networkIp = $FirewallSubnet -replace '/.*$'
-                $prefixLen = [int]($FirewallSubnet -replace '^.*/', '')
-                $ipBytes = ([System.Net.IPAddress]::Parse($ip.IPAddress)).GetAddressBytes()
-                $netBytes = ([System.Net.IPAddress]::Parse($networkIp)).GetAddressBytes()
-                $ipNum = [uint32]$ipBytes[0] -shl 24 -bor [uint32]$ipBytes[1] -shl 16 -bor [uint32]$ipBytes[2] -shl 8 -bor [uint32]$ipBytes[3]
-                $netNum = [uint32]$netBytes[0] -shl 24 -bor [uint32]$netBytes[1] -shl 16 -bor [uint32]$netBytes[2] -shl 8 -bor [uint32]$netBytes[3]
-                $mask = if ($prefixLen -eq 0) { [uint32]0 } else { [uint32]([uint32]::MaxValue -shl (32 - $prefixLen)) }
-                if (($ipNum -band $mask) -eq ($netNum -band $mask)) { $localIps += $ip.IPAddress }
-            }
-        } catch {}
-        if ($localIps.Count -gt 0) {
-            foreach ($ip in $localIps) { Write-Log " API по сети : http://${ip}:$Port ($FirewallSubnet)" }
-        } else {
-            Write-Log " API по сети : http://<IP-сервера>:$Port ($FirewallSubnet)"
-        }
+    if ($selectedModels.Count -gt 0) {
+        Write-Log " Пример      : `"model`": `"$($selectedModels[0])`"" -Color DarkGray
     }
-
-    if ($AddToPath) { Write-Log " PATH        : $LlamaCppDir добавлен (нужна новая консоль)" }
-    if ($AddNssmToPath) { Write-Log " NSSM PATH   : $NssmDir\win32 и \win64 (нужна новая консоль)" }
-    Write-Log " Проверка    : curl http://127.0.0.1:$Port/health"
-    Write-Log " Запрос      : POST /v1/chat/completions с `"model`": `"$($selectedModels[0])`"" -Color DarkGray
 }
 catch {
     Write-Log "`nERROR: $_" -Color Red
