@@ -7,7 +7,7 @@
     Читает llama-windows-install.ini. Запускает llama-server без --model,
     с --models-dir и --models-max 1 (Router). При установке предлагает выбрать
     модели; для выбранных генерируется preset.ini с hf-repo/hf-file, и можно
-    сразу скачать их с прогресс-баром. Иначе Router скачает при первом запросе.
+    сразу скачать их с текстовым прогресс-баром. Иначе Router скачает при первом запросе.
 #>
 [CmdletBinding()]
 param(
@@ -756,12 +756,12 @@ function Invoke-ModelDownload {
                         $totalMb = [math]::Round($totalBytes / 1MB, 1)
                         $percent = [int](($totalRead / $totalBytes) * 100)
                         if ($percent -gt 100) { $percent = 100 }
-                        Write-Progress -Activity "Скачивание $DisplayName" `
-                            -Status "$readMb / $totalMb MB ($percent%)" `
-                            -PercentComplete $percent
+                        $msg = "  Скачивание {0}: {1} / {2} MB ({3}%)" -f $DisplayName, $readMb, $totalMb, $percent
                     } else {
-                        Write-Progress -Activity "Скачивание $DisplayName" -Status "$readMb MB"
+                        $msg = "  Скачивание {0}: {1} MB" -f $DisplayName, $readMb
                     }
+                    # Выводим текстовый прогресс (дополняем пробелами, чтобы перекрыть предыдущую строку)
+                    Write-Host ("`r" + $msg + (" " * 15)) -NoNewline
                     $lastUpdate = $now
                 }
             }
@@ -770,7 +770,8 @@ function Invoke-ModelDownload {
             $httpStream.Close()
         }
 
-        if (-not $NoProgress) { Write-Progress -Activity "Скачивание $DisplayName" -Completed }
+        # Переход на новую строку после завершения прогресса
+        if (-not $NoProgress) { Write-Host "" }
 
         if ($totalBytes -gt 0) {
             $actualSize = (Get-Item -LiteralPath $partFile).Length
@@ -786,6 +787,7 @@ function Invoke-ModelDownload {
         Write-Log "  ✓ Скачано: $Destination ($finalMb MB)" -Color Green
         return $true
     } catch {
+        if (-not $NoProgress) { Write-Host "" } # Переход на новую строку в случае ошибки
         Write-Log "  ✗ Ошибка скачивания $DisplayName : $_" -Color Red
         Write-Log "  ℹ Частичный файл сохранён: $partFile (докачается при повторном запуске)" -Color DarkGray
         return $false
@@ -1078,7 +1080,7 @@ try {
         if (Test-Path $presetPath) { Remove-Item -LiteralPath $presetPath -Force -ErrorAction SilentlyContinue }
     }
 
-    # ─── Предзагрузка моделей с прогресс-баром ───
+    # ─── Предзагрузка моделей с текстовым прогресс-баром ───
     if ($selectedModels.Count -gt 0) {
         $doPreDownload = $PreDownload
         if (-not $Force) {
