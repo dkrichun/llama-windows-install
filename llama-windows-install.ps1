@@ -150,10 +150,11 @@ $BackupDir    = [IO.Path]::GetFullPath($BackupDir)
 $InstallPath  = [IO.Path]::GetFullPath($scriptDir)
 $ApiKeysTxt   = [IO.Path]::GetFullPath((Join-Path $LlamaCppDir 'api-keys.txt'))
 $ApiKeysJson  = [IO.Path]::GetFullPath((Join-Path $LlamaCppDir 'api-keys.json'))
+$VersionFile  = [IO.Path]::GetFullPath((Join-Path $LlamaCppDir '.installed_version'))
 
 # Защищённые пути (не бэкапятся и не удаляются при обновлении)
 $protectedPaths = @(
-    $InstallPath, $LogsDir, $DownloadsDir, $BackupDir, $ModelsDir, $CacheDir, $ApiKeysTxt, $ApiKeysJson
+    $InstallPath, $LogsDir, $DownloadsDir, $BackupDir, $ModelsDir, $CacheDir, $ApiKeysTxt, $ApiKeysJson, $VersionFile
 ) | Select-Object -Unique
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -190,8 +191,15 @@ function Get-CachedFile {
     $cachePath = Join-Path $targetDir $FileName
     $urlStamp  = "$cachePath.url"
 
+    # Проверяем кэш
     if ($KeepDownloads -and -not $ForceRedownload -and (Test-Path $cachePath) -and (Test-Path $urlStamp)) {
-        if ((Get-Content $urlStamp -Raw).Trim() -eq $Url) { return $cachePath }
+        $cachedUrl = ''
+        try { $cachedUrl = (Get-Content $urlStamp -Raw -ErrorAction Stop).Trim() } catch { }
+        if ($cachedUrl -eq $Url) {
+            $sizeMb = [math]::Round((Get-Item $cachePath).Length / 1MB, 1)
+            Write-Log "  ✓ Найдено в кэше: $cachePath ($sizeMb MB) — повторное скачивание не требуется" -Color Green
+            return $cachePath
+        }
     }
 
     if (Test-Path $cachePath) { Remove-Item $cachePath -Force }
@@ -483,9 +491,47 @@ function Invoke-ModelDownload {
 try {
     $llamaServerExe = Join-Path $LlamaCppDir 'llama-server.exe'
     $currentVersion = $null
+    $currentVersionRaw = $null
+
+    # 1. Пытаемся определить версию из бинарника
     if (Test-Path $llamaServerExe) {
-        $verOut = (& $llamaServerExe --version 2>&1) -join ' '
-        if ($verOut -match 'version:\s*b?(\d{3,})') { $currentVersion = "b$($matches[1])"; Write-Log "`n  ℹ Установленная версия: $currentVersion" -Color Green }
+        $verOut = ''
+        try { $verOut = (& $llamaServerExe --version 2>&1) -join ' ' } catch { }
+
+        # Формат b12184+: "version: 0.9.0-dev (build 12184, commit ...)"
+        if ($verOut -match 'build\s+(\d{3,})') {
+            $currentVersion = "b$($matches[1])"
+            $currentVersionRaw = $verOut.Trim()
+        }
+        elseif ($verOut -match 'version:\s*b?(\d{3,})\b') {
+            $currentVersion = "b$($matches[1])"
+            $currentVersionRaw = $verOut.Trim()
+        }
+        elseif ($verOut -match '\bb(\d{3,})\b') {
+            $currentVersion = "b$($matches[1])"
+            $currentVersionRaw = $verOut.Trim()
+        }
+    }
+
+    # 2. Fallback: читаем кэш версии
+    if (-not $currentVersion -and (Test-Path $VersionFile)) {
+        try {
+            $cached = (Get-Content -LiteralPath $VersionFile -Raw -ErrorAction Stop).Trim()
+            if ($cached -match '^b\d+') { $currentVersion = $cached }
+        } catch { }
+    }
+
+    # 3. Выводим результат
+    if ($currentVersion) {
+        Write-Log "`n  ℹ Установленная версия: $currentVersion" -Color Green
+        if ($currentVersionRaw -and $currentVersionRaw -ne $currentVersion) {
+            Write-Log "    $currentVersionRaw" -Color DarkGray
+        }
+    } elseif (Test-Path $llamaServerExe) {
+        Write-Log "`n  ℹ Бинарник присутствует, но версию распознать не удалось." -Color DarkGray
+        if ($verOut) { Write-Log "    Вывод: $($verOut.Trim())" -Color DarkGray }
+    } else {
+        Write-Log "`n  ℹ llama.cpp не установлен — будет выполнена первичная установка." -Color Cyan
     }
 
     Write-Step "Выбор версии llama.cpp"
@@ -502,10 +548,14 @@ try {
     }
 
     $isReinstall = ($currentVersion -eq $targetVersion)
-    $needsBackup = ($currentVersion -and (Test-Path $LlamaCppDir))
+    
+    # Бэкап нужен всегда, если существует бинарник
+    $needsBackup = Test-Path $llamaServerExe
 
     if (-not $Force -and $needsBackup) {
-        if ($isReinstall) { if ((Read-Host "Переустановить $currentVersion? [Y/n]") -eq 'n') { exit 0 } }
+        if ($isReinstall) { 
+            if ((Read-Host "Переустановить $currentVersion? [Y/n]") -eq 'n') { exit 0 } 
+        }
         if ((Read-Host 'Продолжить? [Y/n]') -eq 'n') { exit 0 }
     }
 
@@ -534,9 +584,14 @@ try {
     Write-Step "Установка NSSM"
     $nssmExe = Get-ChildItem -Path $NssmDir -Filter nssm.exe -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match '\\win64\\' } | Select-Object -First 1 -ExpandProperty FullName
     if (-not $nssmExe -or $forceDL) {
-        $nssmZip = Get-CachedFile -Url $NssmUrl -FileName (Get-FileNameFromUrl $NssmUrl) -SubDir 'nssm'
+        $nssmVer = if ($NssmUrl -match '/download/([^/]+)/') { $matches[1] -replace '^v', '' } else { 'unknown' }
+        $nssmSubDir = "nssm_$nssmVer"
+        $nssmZipName = Get-FileNameFromUrl -Url $NssmUrl
+        $nssmZip = Get-CachedFile -Url $NssmUrl -FileName $nssmZipName -SubDir $nssmSubDir -ForceRedownload:$forceDL
         Expand-Archive -Path $nssmZip -DestinationPath $NssmDir -Force
         $nssmExe = Get-ChildItem -Path $NssmDir -Filter nssm.exe -Recurse | Where-Object { $_.FullName -match '\\win64\\' } | Select-Object -First 1 -ExpandProperty FullName
+    } else {
+        Write-Log "  ✓ NSSM уже установлен: $nssmExe" -Color Green
     }
     Add-NssmToMachinePath -NssmDir $NssmDir
 
@@ -545,16 +600,19 @@ try {
         $backupPath = Join-Path $BackupDir "LlamaCpp_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
         New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
         
-        # Бэкапим только то, что не входит в $protectedPaths
         $itemsToBackup = Get-ChildItem -Path $LlamaCppDir | Where-Object { $protectedPaths -notcontains [IO.Path]::GetFullPath($_.FullName) }
-        foreach ($item in $itemsToBackup) {
-            Copy-Item -Path $item.FullName -Destination $backupPath -Recurse -Force
+        if ($itemsToBackup.Count -eq 0) {
+            Write-Log "  ℹ Нечего бэкапить (бинарники не найдены или всё защищено)" -Color DarkGray
+        } else {
+            foreach ($item in $itemsToBackup) {
+                Copy-Item -Path $item.FullName -Destination $backupPath -Recurse -Force
+                Write-Log "    Сохранён: $($item.Name)" -Color DarkGray
+            }
+            Write-Log "  ✓ Бэкап создан: $backupPath" -Color Green
         }
-        Write-Log "  ✓ Бэкап создан: $backupPath" -Color Green
 
         Write-Step "Очистка старых файлов"
-        $itemsToRemove = Get-ChildItem -Path $LlamaCppDir | Where-Object { $protectedPaths -notcontains [IO.Path]::GetFullPath($_.FullName) }
-        foreach ($item in $itemsToRemove) {
+        foreach ($item in $itemsToBackup) {
             Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
         }
         Write-Log "  ✓ Старые файлы удалены (защищённые папки сохранены)" -Color Green
@@ -571,6 +629,8 @@ try {
         $cudartZip = Get-CachedFile -Url $cudartDownloadUrl -FileName "cudart-llama-bin-win-cuda-13.5-x64.zip" -SubDir "cudart_$targetVersion" -ForceRedownload:$forceDL
         Expand-Archive -Path $llamaZip -DestinationPath $LlamaCppDir -Force
         Expand-Archive -Path $cudartZip -DestinationPath $LlamaCppDir -Force
+    } else {
+        Write-Log "  ℹ Установка не требуется (используется текущая)" -Color DarkGray
     }
 
     [Environment]::SetEnvironmentVariable('LLAMA_CPP_DIR', $LlamaCppDir, 'Machine')
@@ -663,13 +723,23 @@ try {
     }
     if (-not $apiOk) { Write-Log "API не ответил, но служба работает. Проверьте логи." -Color Yellow }
 
+    # Сохраняем установленную версию в кэш
+    if ($targetVersion) {
+        try { Set-Content -LiteralPath $VersionFile -Value $targetVersion -NoNewline -Encoding UTF8 } catch { }
+    }
+
     Write-Log "`n=============================" -Color Green
     Write-Log " Развёртывание завершено (Router mode)" -Color Green
     Write-Log '=============================' -Color Green
-    Write-Log " API: http://127.0.0.1:$Port"
-    Write-Log " Модели в: $ModelsDir"
+    Write-Log " Служба      : $ServiceName"
+    Write-Log " Версия была : $(if($currentVersion){$currentVersion}else{'(не установлена)'})"
+    Write-Log " Версия стала: $(if($targetVersion){$targetVersion}else{'(не определена)'})" -Color Green
+    Write-Log " Бинарник    : $llamaServerExe"
+    Write-Log " Модели в    : $ModelsDir"
+    Write-Log " API         : http://127.0.0.1:$Port"
+    Write-Log " Health-check: http://127.0.0.1:$Port/health"
     if ($selectedModels.Count -gt 0) {
-        Write-Log " Пример запроса: `"model`": `"$((Get-PresetEntry -Name $selectedModels[0]).HfFile)`"" -Color DarkGray
+        Write-Log " Пример      : `"model`": `"$((Get-PresetEntry -Name $selectedModels[0]).HfFile)`"" -Color DarkGray
     }
 }
 catch {
