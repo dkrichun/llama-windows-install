@@ -2,12 +2,6 @@
 <#
 .SYNOPSIS
     Удаление службы LlamaCpp.
-
-.DESCRIPTION
-    Читает llama-windows-install.ini. Останавливает и удаляет службу,
-    чистит брандмауэр, PATH (LlamaCppDir, NSSM\win32, NSSM\win64)
-    и переменные окружения. Каталоги (модели, логи, бэкапы, архивы)
-    удаляются только по явным флагам.
 #>
 [CmdletBinding()]
 param(
@@ -92,6 +86,7 @@ function Get-CfgBool {
 
 $LlamaCppDir   = Get-Cfg     'paths'   'LlamaCppDir'    'D:\AI\Llama.cpp'
 $ModelsDir     = Get-Cfg     'paths'   'ModelsDir'      ''
+$CacheDir      = Get-Cfg     'paths'   'CacheDir'       ''
 $NssmDir       = Get-Cfg     'paths'   'NssmDir'        'C:\Program Files\NSSM'
 $LogsDir       = Get-Cfg     'paths'   'LogsDir'        ''
 $DownloadsDir  = Get-Cfg     'paths'   'DownloadsDir'   ''
@@ -99,14 +94,16 @@ $BackupDir     = Get-Cfg     'paths'   'BackupDir'      ''
 $ServiceName   = Get-Cfg     'service' 'ServiceName'    'LlamaCpp'
 $AddToPath     = Get-CfgBool 'service' 'AddToPath'      $true
 $AddNssmToPath = Get-CfgBool 'service' 'AddNssmToPath'  $true
-$Port          = [int](Get-Cfg 'network' 'Port'         '8080')
+$Port          = [int](Get-Cfg 'network' 'Port'         '9931')
 
 if ([string]::IsNullOrWhiteSpace($ModelsDir)) { $ModelsDir = Join-Path $LlamaCppDir 'Models' } elseif (-not [IO.Path]::IsPathRooted($ModelsDir)) { $ModelsDir = Join-Path $LlamaCppDir $ModelsDir }
+if ([string]::IsNullOrWhiteSpace($CacheDir)) { $CacheDir = Join-Path $LlamaCppDir 'Cache' } elseif (-not [IO.Path]::IsPathRooted($CacheDir)) { $CacheDir = Join-Path $LlamaCppDir $CacheDir }
 if ([string]::IsNullOrWhiteSpace($LogsDir)) { $LogsDir = Join-Path $LlamaCppDir 'logs' } elseif (-not [IO.Path]::IsPathRooted($LogsDir)) { $LogsDir = Join-Path $LlamaCppDir $LogsDir }
 if ([string]::IsNullOrWhiteSpace($DownloadsDir)) { $DownloadsDir = Join-Path $LlamaCppDir 'Downloads' } elseif (-not [IO.Path]::IsPathRooted($DownloadsDir)) { $DownloadsDir = Join-Path $LlamaCppDir $DownloadsDir }
 if ([string]::IsNullOrWhiteSpace($BackupDir)) { $BackupDir = Join-Path $LlamaCppDir 'Backup' } elseif (-not [IO.Path]::IsPathRooted($BackupDir)) { $BackupDir = Join-Path $LlamaCppDir $BackupDir }
 
 $ModelsDir    = [IO.Path]::GetFullPath($ModelsDir)
+$CacheDir     = [IO.Path]::GetFullPath($CacheDir)
 $LogsDir      = [IO.Path]::GetFullPath($LogsDir)
 $DownloadsDir = [IO.Path]::GetFullPath($DownloadsDir)
 $BackupDir    = [IO.Path]::GetFullPath($BackupDir)
@@ -201,15 +198,13 @@ try {
     Write-Step "Бинарники: $LlamaCppDir"
     if (Test-Path $LlamaCppDir) {
         if ($PurgeLlamaCpp) {
-            Write-Host '  ⚠ Папки install, logs, Downloads, Backup, Models сохраняются'
-            if (Confirm-Action "Удалить бинарники в $LlamaCppDir (кроме защищённых папок)?") {
+            Write-Host '  ⚠ Папки Install, logs, Downloads, Backup, Models, Cache и api-keys.txt сохраняются'
+            if (Confirm-Action "Удалить бинарники в $LlamaCppDir (кроме защищённых папок и файлов)?") {
+                $ApiKeysTxt  = [IO.Path]::GetFullPath((Join-Path $LlamaCppDir 'api-keys.txt'))
+                $ApiKeysJson = [IO.Path]::GetFullPath((Join-Path $LlamaCppDir 'api-keys.json'))
+
                 $protectedPaths = @(
-                    $InstallPath
-                    [IO.Path]::GetFullPath($LogsDir)
-                    [IO.Path]::GetFullPath($DownloadsDir)
-                    [IO.Path]::GetFullPath($BackupDir)
-                    [IO.Path]::GetFullPath($ModelsDir)
-                    [IO.Path]::GetFullPath($NssmDir)
+                    $InstallPath, $LogsDir, $DownloadsDir, $BackupDir, $ModelsDir, $CacheDir, $ApiKeysTxt, $ApiKeysJson, $NssmDir
                 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
 
                 $itemsToRemove = Get-ChildItem -Path $LlamaCppDir | Where-Object {
@@ -219,7 +214,7 @@ try {
                 foreach ($item in $itemsToRemove) {
                     Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
                 }
-                Write-Host '  ✓ Бинарники удалены (защищённые папки сохранены)'
+                Write-Host '  ✓ Бинарники удалены (защищённые папки и файлы сохранены)'
             }
         } else {
             Write-Host '  ℹ Сохранён (используйте -PurgeLlamaCpp)'

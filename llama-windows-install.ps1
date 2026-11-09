@@ -99,6 +99,7 @@ function Get-CfgInt {
 # ─── 2. Конфигурация ───
 $LlamaCppDir      = Get-Cfg     'paths'     'LlamaCppDir'        'D:\AI\Llama.cpp'
 $ModelsDir        = Get-Cfg     'paths'     'ModelsDir'          ''
+$CacheDir         = Get-Cfg     'paths'     'CacheDir'           ''
 $NssmDir          = Get-Cfg     'paths'     'NssmDir'            'C:\Program Files\NSSM'
 $LogsDir          = Get-Cfg     'paths'     'LogsDir'            ''
 $DownloadsDir     = Get-Cfg     'paths'     'DownloadsDir'       ''
@@ -136,17 +137,24 @@ if ($Upgrade) {
 
 # Нормализация путей
 if ([string]::IsNullOrWhiteSpace($ModelsDir)) { $ModelsDir = Join-Path $LlamaCppDir 'Models' } elseif (-not [IO.Path]::IsPathRooted($ModelsDir)) { $ModelsDir = Join-Path $LlamaCppDir $ModelsDir }
+if ([string]::IsNullOrWhiteSpace($CacheDir)) { $CacheDir = Join-Path $LlamaCppDir 'Cache' } elseif (-not [IO.Path]::IsPathRooted($CacheDir)) { $CacheDir = Join-Path $LlamaCppDir $CacheDir }
 if ([string]::IsNullOrWhiteSpace($LogsDir)) { $LogsDir = Join-Path $LlamaCppDir 'logs' } elseif (-not [IO.Path]::IsPathRooted($LogsDir)) { $LogsDir = Join-Path $LlamaCppDir $LogsDir }
 if ([string]::IsNullOrWhiteSpace($DownloadsDir)) { $DownloadsDir = Join-Path $LlamaCppDir 'Downloads' } elseif (-not [IO.Path]::IsPathRooted($DownloadsDir)) { $DownloadsDir = Join-Path $LlamaCppDir $DownloadsDir }
 if ([string]::IsNullOrWhiteSpace($BackupDir)) { $BackupDir = Join-Path $LlamaCppDir 'Backup' } elseif (-not [IO.Path]::IsPathRooted($BackupDir)) { $BackupDir = Join-Path $LlamaCppDir $BackupDir }
 
 $ModelsDir    = [IO.Path]::GetFullPath($ModelsDir)
+$CacheDir     = [IO.Path]::GetFullPath($CacheDir)
 $LogsDir      = [IO.Path]::GetFullPath($LogsDir)
 $DownloadsDir = [IO.Path]::GetFullPath($DownloadsDir)
 $BackupDir    = [IO.Path]::GetFullPath($BackupDir)
 $InstallPath  = [IO.Path]::GetFullPath($scriptDir)
+$ApiKeysTxt   = [IO.Path]::GetFullPath((Join-Path $LlamaCppDir 'api-keys.txt'))
+$ApiKeysJson  = [IO.Path]::GetFullPath((Join-Path $LlamaCppDir 'api-keys.json'))
 
-$protectedPaths = @($InstallPath, $LogsDir, $DownloadsDir, $BackupDir, $ModelsDir) | Select-Object -Unique
+# Защищённые пути (не бэкапятся и не удаляются при обновлении)
+$protectedPaths = @(
+    $InstallPath, $LogsDir, $DownloadsDir, $BackupDir, $ModelsDir, $CacheDir, $ApiKeysTxt, $ApiKeysJson
+) | Select-Object -Unique
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -160,8 +168,8 @@ function Stop-LlamaProcesses {
 }
 
 function Set-LlamaAcl {
-    param([string]$LlamaCppDir, [string]$ModelsDir)
-    foreach ($dir in @($LlamaCppDir, $ModelsDir)) {
+    param([string]$LlamaCppDir, [string]$ModelsDir, [string]$CacheDir)
+    foreach ($dir in @($LlamaCppDir, $ModelsDir, $CacheDir)) {
         if ((Test-Path $dir) -and $dir) {
             icacls $dir /grant '*S-1-5-18:(OI)(CI)F' /T 2>&1 | Out-Null
             icacls $dir /grant '*S-1-5-32-544:(OI)(CI)F' /T 2>&1 | Out-Null
@@ -520,8 +528,8 @@ try {
     }
 
     Write-Step 'Создание каталогов'
-    foreach ($d in @($LlamaCppDir, $ModelsDir, $LogsDir, $NssmDir, $DownloadsDir, $BackupDir) | Select-Object -Unique) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
-    Set-LlamaAcl -LlamaCppDir $LlamaCppDir -ModelsDir $ModelsDir
+    foreach ($d in @($LlamaCppDir, $ModelsDir, $CacheDir, $LogsDir, $NssmDir, $DownloadsDir, $BackupDir) | Select-Object -Unique) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    Set-LlamaAcl -LlamaCppDir $LlamaCppDir -ModelsDir $ModelsDir -CacheDir $CacheDir
 
     Write-Step "Установка NSSM"
     $nssmExe = Get-ChildItem -Path $NssmDir -Filter nssm.exe -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match '\\win64\\' } | Select-Object -First 1 -ExpandProperty FullName
@@ -536,8 +544,20 @@ try {
         Write-Step "Резервное копирование"
         $backupPath = Join-Path $BackupDir "LlamaCpp_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
         New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
-        Get-ChildItem -Path $LlamaCppDir | Where-Object { $protectedPaths -notcontains [IO.Path]::GetFullPath($_.FullName) } | ForEach-Object { Copy-Item -Path $_.FullName -Destination $backupPath -Recurse -Force }
-        Get-ChildItem -Path $LlamaCppDir | Where-Object { $protectedPaths -notcontains [IO.Path]::GetFullPath($_.FullName) } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        
+        # Бэкапим только то, что не входит в $protectedPaths
+        $itemsToBackup = Get-ChildItem -Path $LlamaCppDir | Where-Object { $protectedPaths -notcontains [IO.Path]::GetFullPath($_.FullName) }
+        foreach ($item in $itemsToBackup) {
+            Copy-Item -Path $item.FullName -Destination $backupPath -Recurse -Force
+        }
+        Write-Log "  ✓ Бэкап создан: $backupPath" -Color Green
+
+        Write-Step "Очистка старых файлов"
+        $itemsToRemove = Get-ChildItem -Path $LlamaCppDir | Where-Object { $protectedPaths -notcontains [IO.Path]::GetFullPath($_.FullName) }
+        foreach ($item in $itemsToRemove) {
+            Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Write-Log "  ✓ Старые файлы удалены (защищённые папки сохранены)" -Color Green
     }
 
     if ($LogRetentionDays -gt 0 -and (Test-Path $LogsDir)) {
@@ -596,7 +616,7 @@ try {
     )
     if ($useGpu) {
         $serverArgs += @('-ngl', "$NGpuLayers")
-        if ($FlashAttention) { $serverArgs += @('-fa', 'on') } # ИСПРАВЛЕНО: добавлен аргумент 'on'
+        if ($FlashAttention) { $serverArgs += @('-fa', 'on') }
     } else {
         $serverArgs += @('-ngl', '0')
     }
