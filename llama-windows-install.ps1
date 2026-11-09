@@ -14,6 +14,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $forceDL = [bool]$ForceDownload
+$ProgressPreference = 'SilentlyContinue' # Отключаем псевдографику стандартного прогресс-бара
 
 # ─── 0. Инициализация путей и логов ───
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -184,6 +185,7 @@ function Get-FileNameFromUrl {
     return $Fallback
 }
 
+# ─── УЛУЧШЕННАЯ ФУНКЦИЯ СКАЧИВАНИЯ (С ТЕКСТОВЫМ ПРОГРЕССОМ) ───
 function Get-CachedFile {
     param([string]$Url, [string]$FileName, [string]$SubDir = '', [switch]$ForceRedownload)
     $targetDir = if ($SubDir) { Join-Path $DownloadsDir $SubDir } else { $DownloadsDir }
@@ -191,11 +193,8 @@ function Get-CachedFile {
     $cachePath = Join-Path $targetDir $FileName
     $urlStamp  = "$cachePath.url"
 
-    # Проверяем кэш
     if ($KeepDownloads -and -not $ForceRedownload -and (Test-Path $cachePath) -and (Test-Path $urlStamp)) {
-        $cachedUrl = ''
-        try { $cachedUrl = (Get-Content $urlStamp -Raw -ErrorAction Stop).Trim() } catch { }
-        if ($cachedUrl -eq $Url) {
+        if ((Get-Content $urlStamp -Raw).Trim() -eq $Url) {
             $sizeMb = [math]::Round((Get-Item $cachePath).Length / 1MB, 1)
             Write-Log "  ✓ Найдено в кэше: $cachePath ($sizeMb MB) — повторное скачивание не требуется" -Color Green
             return $cachePath
@@ -205,9 +204,51 @@ function Get-CachedFile {
     if (Test-Path $cachePath) { Remove-Item $cachePath -Force }
     if (Test-Path $urlStamp)  { Remove-Item $urlStamp -Force }
     Write-Log "  → Скачивание: $Url"
-    Invoke-WebRequest -Uri $Url -OutFile $cachePath -UseBasicParsing
-    if ($KeepDownloads) { Set-Content $urlStamp -Value $Url -NoNewline }
-    return $cachePath
+    
+    $partFile = "$cachePath.part"
+    if (Test-Path $partFile) { Remove-Item $partFile -Force }
+
+    Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromHours(4)
+    $client.DefaultRequestHeaders.Add('User-Agent', 'PowerShell-LlamaCpp')
+
+    try {
+        $response = $client.GetAsync($Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
+        $response.EnsureSuccessStatusCode()
+        $totalBytes = if ($response.Content.Headers.ContentLength) { [long]$response.Content.Headers.ContentLength } else { 0 }
+
+        $fileStream = New-Object System.IO.FileStream($partFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+        $httpStream = $response.Content.ReadAsStreamAsync().Result
+        $buffer = New-Object byte[] 81920
+        $totalRead = 0
+        $lastUpdate = [DateTime]::MinValue
+
+        try {
+            while (($read = $httpStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $fileStream.Write($buffer, 0, $read); $totalRead += $read
+                if (([DateTime]::Now - $lastUpdate).TotalMilliseconds -ge 200) {
+                    $readMb = [math]::Round($totalRead / 1MB, 1)
+                    if ($totalBytes -gt 0) {
+                        $percent = [int](($totalRead / $totalBytes) * 100)
+                        $msg = "  Загрузка {0}: {1} / {2} MB ({3}%)" -f $FileName, $readMb, [math]::Round($totalBytes/1MB,1), $percent
+                    } else {
+                        $msg = "  Загрузка {0}: {1} MB" -f $FileName, $readMb
+                    }
+                    Write-Host ("`r" + $msg + (" " * 10)) -NoNewline
+                    $lastUpdate = [DateTime]::Now
+                }
+            }
+        } finally { $fileStream.Close(); $httpStream.Close() }
+        Write-Host ""
+        
+        Move-Item $partFile $cachePath -Force
+        if ($KeepDownloads) { Set-Content $urlStamp -Value $Url -NoNewline }
+        return $cachePath
+    } catch {
+        Write-Host ""
+        throw "Ошибка скачивания $Url : $_"
+    } finally { $client.Dispose() }
 }
 
 function Add-ToMachinePath {
@@ -300,7 +341,9 @@ function Test-VCRedist {
 function Install-VCRedist {
     $outFile = Join-Path $env:TEMP 'vc_redist.x64.exe'
     try {
+        Write-Log "  → Скачивание Visual C++ Redistributable..." -Color Cyan
         Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile $outFile -UseBasicParsing
+        Write-Log "  → Установка (тихий режим)..." -Color Cyan
         $p = Start-Process -FilePath $outFile -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru -NoNewWindow
         return ($p.ExitCode -in @(0, 1638, 3010))
     } catch { return $false } finally { if (Test-Path $outFile) { Remove-Item $outFile -Force -ErrorAction SilentlyContinue } }
@@ -348,30 +391,6 @@ function Test-CudaCompatibility {
     }
     Write-Log "  ✗ Версия CUDA несовместима! Требуется $reqMajor.x, обнаружена $cudaVerStr" -Color Red
     return $false
-}
-
-function Test-LlamaServeDirect {
-    param([string]$Exe, [string]$Args, [int]$WaitSec = 15)
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $Exe; $psi.Arguments = $Args; $psi.UseShellExecute = $false
-    $psi.RedirectStandardError = $true; $psi.RedirectStandardOutput = $true; $psi.CreateNoWindow = $true
-    try {
-        $proc = [System.Diagnostics.Process]::Start($psi)
-        $stdoutSb = New-Object System.Text.StringBuilder; $stderrSb = New-Object System.Text.StringBuilder
-        $outEvt = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action { if ($EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) } } -MessageData $stdoutSb
-        $errEvt = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived  -Action { if ($EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) } } -MessageData $stderrSb
-        $proc.BeginOutputReadLine(); $proc.BeginErrorReadLine()
-        Start-Sleep -Seconds $WaitSec
-        $exited = $proc.HasExited
-        Start-Sleep -Milliseconds 500
-        Unregister-Event -SourceIdentifier $outEvt.Name -ErrorAction SilentlyContinue
-        Unregister-Event -SourceIdentifier $errEvt.Name -ErrorAction SilentlyContinue
-        if (-not $exited) { try { $proc.Kill() } catch {} } else {
-            $err = $stderrSb.ToString()
-            if ($err -and $err.Trim()) { Write-Log "    STDERR:" -Color Yellow; $err -split "`n" | Select-Object -First 20 | ForEach-Object { Write-Log "      $_" -Color DarkGray } }
-        }
-        return ($exited -eq $false)
-    } catch { return $false }
 }
 
 function Start-LlamaService {
@@ -498,7 +517,6 @@ try {
         $verOut = ''
         try { $verOut = (& $llamaServerExe --version 2>&1) -join ' ' } catch { }
 
-        # Формат b12184+: "version: 0.9.0-dev (build 12184, commit ...)"
         if ($verOut -match 'build\s+(\d{3,})') {
             $currentVersion = "b$($matches[1])"
             $currentVersionRaw = $verOut.Trim()
@@ -548,8 +566,6 @@ try {
     }
 
     $isReinstall = ($currentVersion -eq $targetVersion)
-    
-    # Бэкап нужен всегда, если существует бинарник
     $needsBackup = Test-Path $llamaServerExe
 
     if (-not $Force -and $needsBackup) {
@@ -595,25 +611,41 @@ try {
     }
     Add-NssmToMachinePath -NssmDir $NssmDir
 
+    # ─── БЭКАП С ПРОГРЕСС-БАРОМ ───
     if ($needsBackup) {
         Write-Step "Резервное копирование"
         $backupPath = Join-Path $BackupDir "LlamaCpp_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
         New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
         
         $itemsToBackup = Get-ChildItem -Path $LlamaCppDir | Where-Object { $protectedPaths -notcontains [IO.Path]::GetFullPath($_.FullName) }
-        if ($itemsToBackup.Count -eq 0) {
+        $totalItems = $itemsToBackup.Count
+
+        if ($totalItems -eq 0) {
             Write-Log "  ℹ Нечего бэкапить (бинарники не найдены или всё защищено)" -Color DarkGray
         } else {
+            $currentItem = 0
             foreach ($item in $itemsToBackup) {
                 Copy-Item -Path $item.FullName -Destination $backupPath -Recurse -Force
-                Write-Log "    Сохранён: $($item.Name)" -Color DarkGray
+                $currentItem++
+                $percent = [int](($currentItem / $totalItems) * 100)
+                $msg = "  Копирование: {0} / {1} ({2}%)" -f $currentItem, $totalItems, $percent
+                Write-Host ("`r" + $msg + (" " * 10)) -NoNewline
             }
+            Write-Host ""
             Write-Log "  ✓ Бэкап создан: $backupPath" -Color Green
         }
 
         Write-Step "Очистка старых файлов"
-        foreach ($item in $itemsToBackup) {
-            Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        if ($totalItems -gt 0) {
+            $currentItem = 0
+            foreach ($item in $itemsToBackup) {
+                Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                $currentItem++
+                $percent = [int](($currentItem / $totalItems) * 100)
+                $msg = "  Удаление: {0} / {1} ({2}%)" -f $currentItem, $totalItems, $percent
+                Write-Host ("`r" + $msg + (" " * 10)) -NoNewline
+            }
+            Write-Host ""
         }
         Write-Log "  ✓ Старые файлы удалены (защищённые папки сохранены)" -Color Green
     }
