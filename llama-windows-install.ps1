@@ -185,7 +185,6 @@ function Get-FileNameFromUrl {
     return $Fallback
 }
 
-# ─── УЛУЧШЕННАЯ ФУНКЦИЯ СКАЧИВАНИЯ (С ТЕКСТОВЫМ ПРОГРЕССОМ) ───
 function Get-CachedFile {
     param([string]$Url, [string]$FileName, [string]$SubDir = '', [switch]$ForceRedownload)
     $targetDir = if ($SubDir) { Join-Path $DownloadsDir $SubDir } else { $DownloadsDir }
@@ -215,7 +214,7 @@ function Get-CachedFile {
 
     try {
         $response = $client.GetAsync($Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
-        $response.EnsureSuccessStatusCode()
+        $response.EnsureSuccessStatusCode() | Out-Null # ИСПРАВЛЕНО: добавлен Out-Null
         $totalBytes = if ($response.Content.Headers.ContentLength) { [long]$response.Content.Headers.ContentLength } else { 0 }
 
         $fileStream = New-Object System.IO.FileStream($partFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
@@ -469,7 +468,7 @@ function Invoke-ModelDownload {
         $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $Url)
         if ($resumeFrom -gt 0) { $request.Headers.Range = New-Object System.Net.Http.Headers.RangeHeaderValue -ArgumentList $resumeFrom, $null }
         $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
-        $response.EnsureSuccessStatusCode()
+        $response.EnsureSuccessStatusCode() | Out-Null # ИСПРАВЛЕНО: добавлен Out-Null
         $totalBytes = if ($response.Content.Headers.ContentLength) { [long]$response.Content.Headers.ContentLength } else { 0 }
         if ($resumeFrom -gt 0 -and $totalBytes) { $totalBytes += $resumeFrom }
 
